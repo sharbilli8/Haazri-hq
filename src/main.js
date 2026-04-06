@@ -72,39 +72,27 @@ function toast(msg, type='default') {
 function renderLogin() {
   document.getElementById('app').innerHTML = `
   <div class="login-page">
-    <div class="login-left">
-      <div class="login-brand">
-        <div class="login-brand-icon">⏱</div>
+    <div class="login-box">
+      <div class="login-logo-row">
+        <div class="login-logo-icon">⏱</div>
         <div>
-          <div class="login-brand-name">Haazri HQ</div>
-          <div class="login-brand-tag">attendance system</div>
+          <div class="login-logo-name">Haazri HQ</div>
+          <div class="login-logo-sub">attendance</div>
         </div>
       </div>
-      <div class="login-headline">Track your team's<br><span>attendance</span><br>effortlessly.</div>
-      <div class="login-desc">A secure, device-locked check-in system for your team. No more buddy punching.</div>
-      <div class="login-feature-list">
-        <div class="login-feature"><span class="login-feature-dot"></span>Device-locked logins — one device per member</div>
-        <div class="login-feature"><span class="login-feature-dot"></span>Auto late-detection based on office time</div>
-        <div class="login-feature"><span class="login-feature-dot"></span>Admin dashboard with performance stats</div>
-        <div class="login-feature"><span class="login-feature-dot"></span>CSV exports for any date range</div>
+      <div class="login-form-title">Welcome back</div>
+      <div class="login-form-sub">Sign in to continue.</div>
+      <div id="loginErr" class="error-banner"></div>
+      <div class="field-group">
+        <label class="field-label">Username</label>
+        <input type="text" id="lu" placeholder="your username" autocomplete="username" />
       </div>
-    </div>
-    <div class="login-right">
-      <div class="login-form-box">
-        <div class="login-form-title">Welcome back</div>
-        <div class="login-form-sub">Sign in to your Haazri HQ account.</div>
-        <div id="loginErr" class="error-banner">Incorrect username or password.</div>
-        <div class="field-group">
-          <label class="field-label">Username</label>
-          <input type="text" id="lu" placeholder="your username" autocomplete="username" />
-        </div>
-        <div class="field-group">
-          <label class="field-label">Password</label>
-          <input type="password" id="lp" placeholder="••••••••" autocomplete="current-password" onkeydown="if(event.key==='Enter')doLogin()" />
-        </div>
-        <button class="btn btn-primary btn-full" id="loginBtn" onclick="doLogin()">Sign in</button>
-        <div class="login-note">First sign-in registers your device.<br>Only that device may be used for future logins.</div>
+      <div class="field-group">
+        <label class="field-label">Password</label>
+        <input type="password" id="lp" placeholder="••••••••" autocomplete="current-password" onkeydown="if(event.key==='Enter')doLogin()" />
       </div>
+      <button class="btn btn-primary btn-full" id="loginBtn" onclick="doLogin()">Sign in</button>
+      <div class="login-note">First sign-in registers your device.<br>Only that device may be used for future logins.</div>
     </div>
   </div>`
 }
@@ -202,24 +190,23 @@ function renderAttendanceContent(record) {
   const el = document.getElementById('attendanceContent'); if (!el) return
 
   if (record) {
-    // Already has a record
     const statusConf = {
-      present: { cls:'sr-present', icon:'✅', label:'Present', color:'var(--green)' },
-      late:    { cls:'sr-late',    icon:'🕐', label:'Late',    color:'var(--amber)' },
-      absent:  { cls:'sr-absent',  icon:'❌', label:'Absent',  color:'var(--red)'   },
-      on_leave:{ cls:'sr-leave',   icon:'🏖', label:'On Leave',color:'var(--blue)'  },
+      present: { cls:'sr-present', icon:'✅', label:'Present',  color:'var(--green)' },
+      late:    { cls:'sr-late',    icon:'🕐', label:'Late',     color:'var(--amber)' },
+      absent:  { cls:'sr-absent',  icon:'❌', label:'Absent',   color:'var(--red)'   },
+      on_leave:{ cls:'sr-leave',   icon:'🏖', label:'On Leave', color:'var(--blue)'  },
     }
     const sc = statusConf[record.status] || statusConf.present
     const checkedOut = !!record.check_out_time
-
     el.innerHTML = `
       <div class="status-result ${sc.cls}">
         <div class="sr-icon">${sc.icon}</div>
         <div class="sr-status" style="color:${sc.color};">${sc.label}</div>
-        <div class="sr-time">Checked in at ${fmt12(record.check_in_time)}${checkedOut ? ` · Out at ${fmt12(record.check_out_time)}` : ''}</div>
-        ${record.note ? `<div style="font-size:12px;opacity:0.65;margin-top:4px;">"${record.note}"</div>` : ''}
+        <div class="sr-time">
+          ${record.check_in_time ? `Checked in at ${fmt12(record.check_in_time)}` : ''}
+          ${checkedOut ? ` · Out at ${fmt12(record.check_out_time)}` : ''}
+        </div>
       </div>
-
       ${!checkedOut && (record.status === 'present' || record.status === 'late') ? `
         <button class="btn btn-amber btn-full" onclick="doCheckOut('${record.id}')">
           🚪 Check out
@@ -228,62 +215,32 @@ function renderAttendanceContent(record) {
           Tap when leaving for the day
         </div>
       ` : checkedOut ? `
-        <div style="text-align:center;font-size:12.5px;color:var(--text3);padding:8px 0;">
-          You have checked out. See you tomorrow! 👋
+        <div style="text-align:center;font-size:13px;color:var(--text3);padding:10px 0;">
+          ✅ All done for today. See you tomorrow!
         </div>
       ` : ''}
     `
   } else {
-    // No record yet — show check-in options
     el.innerHTML = `
-      <div style="font-size:13px;font-weight:600;color:var(--text2);margin-bottom:10px;">Mark your attendance for today</div>
-      <div class="status-options" id="statusOpts">
-        <div class="status-opt" id="opt-present" onclick="pickStatus('present')">
-          <div class="so-icon">✅</div><div class="so-label">Present</div>
-        </div>
-        <div class="status-opt" id="opt-late" onclick="pickStatus('late')">
-          <div class="so-icon">🕐</div><div class="so-label">Late</div>
-        </div>
-        <div class="status-opt" id="opt-on_leave" onclick="pickStatus('on_leave')">
-          <div class="so-icon">🏖</div><div class="so-label">On Leave</div>
-        </div>
-        <div class="status-opt" id="opt-absent" onclick="pickStatus('absent')">
-          <div class="so-icon">❌</div><div class="so-label">Absent</div>
-        </div>
+      <div style="font-size:13px;color:var(--text2);text-align:center;margin-bottom:16px;">
+        You have not checked in yet today.
       </div>
-      <div class="fg">
-        <label class="field-label">Note (optional)</label>
-        <textarea id="ciNote" placeholder="e.g. Working from home, doctor's appointment…" style="min-height:55px;"></textarea>
-      </div>
-      <button class="btn btn-primary btn-full" id="ciBtn" onclick="doCheckIn()" disabled>
+      <button class="btn btn-primary btn-full" onclick="doCheckIn()">
         ✅ Check in
       </button>
     `
   }
 }
 
-let pickedStatus = null
-window.pickStatus = function(s) {
-  pickedStatus = s
-  const colorMap = { present:'sel-present', late:'sel-late', on_leave:'sel-leave', absent:'sel-absent' }
-  ;['present','late','on_leave','absent'].forEach(k => {
-    const el = document.getElementById('opt-' + k)
-    if (el) el.className = 'status-opt' + (k === s ? ' ' + colorMap[k] : '')
-  })
-  const btn = document.getElementById('ciBtn')
-  if (btn) { btn.disabled = false }
-}
+let pickedStatus = 'present'
+window.pickStatus = function(s) { pickedStatus = s }
 
 window.doCheckIn = async function() {
-  if (!pickedStatus) return
-  const btn  = document.getElementById('ciBtn')
-  const note = document.getElementById('ciNote')?.value?.trim() || null
-  btn.disabled = true; btn.textContent = 'Saving…'
-
+  const btn = document.getElementById('ciBtn')
+  if (btn) { btn.disabled = true; btn.textContent = 'Saving…' }
   const checkInTime = new Date().toISOString()
-  // Auto-detect late based on office time
-  let finalStatus = pickedStatus
-  if (pickedStatus === 'present' && isLate(checkInTime)) finalStatus = 'late'
+  const finalStatus = isLate(checkInTime) ? 'late' : 'present'
+  const note = null
 
   const row = {
     member_id:    currentUser.id,
