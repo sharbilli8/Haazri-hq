@@ -1,411 +1,460 @@
 import './style.css'
-import { supabase } from './supabase.js'
+import { supabase }                      from './supabase.js'
 import { getDeviceFingerprint, hashPassword } from './fingerprint.js'
 
 // ─── State ────────────────────────────────────────────────────
-let currentUser = null   // { id, name, username, role, device_fingerprint, device_approved }
+let currentUser  = null
 let currentToken = null
-let deviceFP = null
-let adminView = 'dashboard'   // current admin view
+let deviceFP     = null
+let officeStart  = '09:00'   // HH:MM — loaded from settings
+let adminView    = 'dashboard'
 
 // ─── Boot ─────────────────────────────────────────────────────
 async function boot() {
   deviceFP = await getDeviceFingerprint()
-  const savedToken = localStorage.getItem('att_token')
-  if (savedToken) {
-    const ok = await resumeSession(savedToken)
-    if (ok) return
-  }
+  const t  = localStorage.getItem('hq_token')
+  if (t && await resumeSession(t)) return
   renderLogin()
 }
 
 async function resumeSession(token) {
   const { data } = await supabase
-    .from('sessions')
-    .select('*, members(*)')
-    .eq('token', token)
-    .gt('expires_at', new Date().toISOString())
-    .single()
-  if (!data || !data.members) return false
-  // Check device matches
+    .from('sessions').select('*, members(*)')
+    .eq('token', token).gt('expires_at', nowStr()).single()
+  if (!data?.members) return false
   if (data.device_fingerprint && data.device_fingerprint !== deviceFP) {
-    localStorage.removeItem('att_token')
-    return false
+    localStorage.removeItem('hq_token'); return false
   }
   currentUser  = data.members
   currentToken = token
-  if (currentUser.role === 'admin') renderAdmin()
-  else renderMemberCheckin()
+  await loadOfficeTime()
+  if (isAdmin()) renderAdmin()
+  else            renderMemberPage()
   return true
 }
 
 // ─── Helpers ──────────────────────────────────────────────────
-const todayStr     = () => new Date().toISOString().slice(0, 10)
-const nowStr       = () => new Date().toISOString()
-const initials     = n => n.trim().split(' ').map(w => w[0]).join('').toUpperCase().slice(0, 2)
-const fmt12        = ts => ts ? new Date(ts).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' }) : '—'
-const fmtDate      = d  => d  ? new Date(d + 'T00:00:00').toLocaleDateString('en-GB', { weekday: 'short', day: '2-digit', month: 'short', year: 'numeric' }) : '—'
-const fmtShortDate = d  => d  ? new Date(d + 'T00:00:00').toLocaleDateString('en-GB', { day: '2-digit', month: 'short' }) : '—'
+const nowStr    = () => new Date().toISOString()
+const todayStr  = () => new Date().toISOString().slice(0, 10)
+const initials  = n => n.trim().split(' ').map(w => w[0]).join('').toUpperCase().slice(0, 2)
+const fmt12     = ts => ts ? new Date(ts).toLocaleTimeString('en-US', { hour:'2-digit', minute:'2-digit' }) : '—'
+const fmtShort  = d  => d  ? new Date(d + 'T00:00:00').toLocaleDateString('en-GB', { day:'2-digit', month:'short' }) : '—'
+const isAdmin   = () => currentUser?.role === 'admin' || currentUser?.role === 'superadmin'
+const isSuperAdmin = () => currentUser?.role === 'superadmin'
+const rand = (n=32) => Array.from(crypto.getRandomValues(new Uint8Array(n))).map(b=>b.toString(16).padStart(2,'0')).join('')
 
-function toast(msg, type = 'default') {
-  let t = document.getElementById('toast')
-  if (!t) { t = document.createElement('div'); t.id = 'toast'; t.className = 'toast'; document.body.appendChild(t) }
-  t.textContent = msg; t.style.borderColor = type === 'error' ? 'var(--red)' : type === 'success' ? 'var(--green-border)' : 'var(--border2)'
-  t.classList.add('show'); setTimeout(() => t.classList.remove('show'), 2800)
+async function loadOfficeTime() {
+  const { data } = await supabase.from('settings').select('value').eq('key','office_start_time').single()
+  if (data?.value) officeStart = data.value.replace(/"/g,'')
 }
 
-function rand(len = 32) {
-  return Array.from(crypto.getRandomValues(new Uint8Array(len))).map(b => b.toString(16).padStart(2,'0')).join('')
-}
-
-function liveClock() {
-  const el = document.getElementById('liveClock')
-  const de = document.getElementById('liveDate')
-  if (!el) return
-  const now = new Date()
-  el.textContent = now.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', second: '2-digit' })
-  if (de) de.textContent = now.toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' })
+function isLate(checkinTime) {
+  if (!checkinTime) return false
+  const [oh, om] = officeStart.split(':').map(Number)
+  const d = new Date(checkinTime)
+  return d.getHours() > oh || (d.getHours() === oh && d.getMinutes() > om)
 }
 
 function statusBadge(s) {
-  const map = { present: '✅ Present', absent: '❌ Absent', late: '🕐 Late', on_leave: '🏖 On Leave' }
-  return `<span class="badge badge-${s}">${map[s] || s}</span>`
+  const map = { present:'✅ Present', late:'🕐 Late', absent:'❌ Absent', on_leave:'🏖 On Leave' }
+  return `<span class="badge b-${s}">${map[s]||s}</span>`
+}
+
+function toast(msg, type='default') {
+  let t = document.getElementById('_toast')
+  if (!t) { t=document.createElement('div'); t.id='_toast'; t.className='toast'; document.body.appendChild(t) }
+  t.textContent = msg
+  t.style.borderColor = type==='error' ? 'var(--red)' : type==='success' ? 'var(--teal-border)' : 'var(--border2)'
+  t.classList.add('show'); setTimeout(()=>t.classList.remove('show'), 2800)
 }
 
 // ─── LOGIN ────────────────────────────────────────────────────
 function renderLogin() {
   document.getElementById('app').innerHTML = `
-    <div class="login-wrap">
-      <div class="login-box">
-        <div class="login-logo">
-          <div class="login-logo-icon">🕐</div>
-          <div>
-            <div class="login-logo-text">Freelance HQ</div>
-            <div class="login-logo-sub">attendance</div>
-          </div>
+  <div class="login-page">
+    <div class="login-left">
+      <div class="login-brand">
+        <div class="login-brand-icon">⏱</div>
+        <div>
+          <div class="login-brand-name">Haazri HQ</div>
+          <div class="login-brand-tag">attendance system</div>
         </div>
-        <div class="login-title">Sign in</div>
-        <div class="login-sub">Enter your username and password to continue.</div>
-        <div id="loginError" class="error-msg">Invalid username or password.</div>
+      </div>
+      <div class="login-headline">Track your team's<br><span>attendance</span><br>effortlessly.</div>
+      <div class="login-desc">A secure, device-locked check-in system for your team. No more buddy punching.</div>
+      <div class="login-feature-list">
+        <div class="login-feature"><span class="login-feature-dot"></span>Device-locked logins — one device per member</div>
+        <div class="login-feature"><span class="login-feature-dot"></span>Auto late-detection based on office time</div>
+        <div class="login-feature"><span class="login-feature-dot"></span>Admin dashboard with performance stats</div>
+        <div class="login-feature"><span class="login-feature-dot"></span>CSV exports for any date range</div>
+      </div>
+    </div>
+    <div class="login-right">
+      <div class="login-form-box">
+        <div class="login-form-title">Welcome back</div>
+        <div class="login-form-sub">Sign in to your Haazri HQ account.</div>
+        <div id="loginErr" class="error-banner">Incorrect username or password.</div>
         <div class="field-group">
           <label class="field-label">Username</label>
-          <input type="text" id="loginUser" placeholder="e.g. hamza" autocomplete="username" />
+          <input type="text" id="lu" placeholder="your username" autocomplete="username" />
         </div>
         <div class="field-group">
           <label class="field-label">Password</label>
-          <input type="password" id="loginPass" placeholder="••••••••" autocomplete="current-password" onkeydown="if(event.key==='Enter')doLogin()" />
+          <input type="password" id="lp" placeholder="••••••••" autocomplete="current-password" onkeydown="if(event.key==='Enter')doLogin()" />
         </div>
-        <button class="btn btn-primary" id="loginBtn" onclick="doLogin()">Sign in</button>
-        <div style="margin-top:18px;font-size:12px;color:var(--text3);text-align:center;line-height:1.6;">
-          First-time sign-in registers this device.<br>After that, only this device can log into your account.
-        </div>
+        <button class="btn btn-primary btn-full" id="loginBtn" onclick="doLogin()">Sign in</button>
+        <div class="login-note">First sign-in registers your device.<br>Only that device may be used for future logins.</div>
       </div>
     </div>
-    <div class="toast" id="toast"></div>
-  `
+  </div>`
 }
 
 window.doLogin = async function() {
-  const username = document.getElementById('loginUser').value.trim().toLowerCase()
-  const password = document.getElementById('loginPass').value
-  const errEl    = document.getElementById('loginError')
+  const username = document.getElementById('lu').value.trim().toLowerCase()
+  const password = document.getElementById('lp').value
+  const errEl    = document.getElementById('loginErr')
   const btn      = document.getElementById('loginBtn')
-  if (!username || !password) { errEl.textContent = 'Please enter username and password.'; errEl.classList.add('show'); return }
-  btn.disabled = true; btn.textContent = 'Signing in…'
-  errEl.classList.remove('show')
+  if (!username || !password) { errEl.textContent='Please fill in both fields.'; errEl.classList.add('show'); return }
+  btn.disabled = true; btn.textContent = 'Signing in…'; errEl.classList.remove('show')
 
   const pwHash = await hashPassword(password)
-  const { data: member, error } = await supabase
-    .from('members')
-    .select('*')
-    .eq('username', username)
-    .eq('password_hash', pwHash)
-    .eq('active', true)
-    .single()
+  const { data: member } = await supabase.from('members').select('*')
+    .eq('username', username).eq('password_hash', pwHash).eq('active', true).single()
 
-  if (error || !member) {
-    errEl.textContent = 'Invalid username or password.'; errEl.classList.add('show')
+  if (!member) {
+    errEl.textContent = 'Incorrect username or password.'; errEl.classList.add('show')
     btn.disabled = false; btn.textContent = 'Sign in'; return
   }
 
-  // Device fingerprint logic
-  if (member.device_fingerprint) {
-    // Device already registered — must match
-    if (member.device_fingerprint !== deviceFP) {
-      errEl.textContent = '🔒 This account is locked to a different device. Contact your admin.'
-      errEl.classList.add('show'); btn.disabled = false; btn.textContent = 'Sign in'; return
-    }
-  } else {
-    // First login — register this device
+  // Device lock check
+  if (member.device_fingerprint && member.device_fingerprint !== deviceFP) {
+    errEl.textContent = '🔒 This account is locked to a different device. Contact your admin.'
+    errEl.classList.add('show'); btn.disabled = false; btn.textContent = 'Sign in'; return
+  }
+  // First login — register device
+  if (!member.device_fingerprint) {
     await supabase.from('members').update({ device_fingerprint: deviceFP, device_approved: true }).eq('id', member.id)
     member.device_fingerprint = deviceFP
-    member.device_approved    = true
   }
 
-  // Create session
   const token   = rand()
-  const expires = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString()
+  const expires = new Date(Date.now() + 30*24*60*60*1000).toISOString()
   await supabase.from('sessions').insert({ member_id: member.id, token, device_fingerprint: deviceFP, expires_at: expires })
-  localStorage.setItem('att_token', token)
-  currentUser  = member
-  currentToken = token
-
-  if (member.role === 'admin') renderAdmin()
-  else renderMemberCheckin()
+  localStorage.setItem('hq_token', token)
+  currentUser = member; currentToken = token
+  await loadOfficeTime()
+  if (isAdmin()) renderAdmin()
+  else            renderMemberPage()
 }
 
 window.doLogout = async function() {
   if (currentToken) await supabase.from('sessions').delete().eq('token', currentToken)
-  localStorage.removeItem('att_token')
-  currentUser = null; currentToken = null
+  localStorage.removeItem('hq_token')
+  currentUser = currentToken = null
   renderLogin()
 }
 
-// ─── MEMBER CHECK-IN VIEW ─────────────────────────────────────
-async function renderMemberCheckin() {
+// ─── MEMBER CHECK-IN / CHECK-OUT PAGE ─────────────────────────
+async function renderMemberPage() {
   const today = todayStr()
-  const { data: existing } = await supabase
-    .from('attendance')
-    .select('*')
-    .eq('member_id', currentUser.id)
-    .eq('date', today)
-    .single()
+  const { data: record } = await supabase.from('attendance')
+    .select('*').eq('member_id', currentUser.id).eq('date', today).single()
 
   document.getElementById('app').innerHTML = `
-    <div class="checkin-wrap">
-      <div class="checkin-card">
-        <div class="checkin-header">
-          <div class="checkin-avatar">${initials(currentUser.name)}</div>
-          <div class="checkin-name">${currentUser.name}</div>
-          <div class="checkin-date" id="liveDate"></div>
-          <div class="today-clock" id="liveClock" style="margin-top:10px;"></div>
+  <div class="checkin-page">
+    <div class="checkin-card">
+      <div class="checkin-topbar">
+        <div class="checkin-logo">
+          <div class="checkin-logo-icon">⏱</div>
+          <div class="checkin-logo-name">Haazri HQ</div>
         </div>
-
-        <div id="checkinContent"></div>
-
-        <button class="btn btn-ghost btn-sm" style="width:100%;margin-top:16px;" onclick="doLogout()">Sign out</button>
+        <span class="logout-link" onclick="doLogout()">Sign out</span>
       </div>
-    </div>
-    <div class="toast" id="toast"></div>
-  `
 
-  setInterval(liveClock, 1000); liveClock()
-  renderCheckinContent(existing)
+      <div class="member-greeting">
+        <div class="member-avatar-lg">${initials(currentUser.name)}</div>
+        <div class="member-name-lg">${currentUser.name}</div>
+      </div>
+
+      <div class="clock-display">
+        <div class="clock-time" id="lc">--:--:--</div>
+        <div class="clock-date" id="ld"></div>
+        <div class="clock-office">Office starts at <strong>${officeStart}</strong></div>
+      </div>
+
+      <div id="attendanceContent"></div>
+    </div>
+  </div>`
+
+  setInterval(tickClock, 1000); tickClock()
+  renderAttendanceContent(record)
 }
 
-function renderCheckinContent(existing) {
-  const el = document.getElementById('checkinContent')
+function tickClock() {
+  const el = document.getElementById('lc'); const de = document.getElementById('ld')
   if (!el) return
+  const n = new Date()
+  el.textContent = n.toLocaleTimeString('en-US', { hour:'2-digit', minute:'2-digit', second:'2-digit' })
+  if (de) de.textContent = n.toLocaleDateString('en-US', { weekday:'long', year:'numeric', month:'long', day:'numeric' })
+}
 
-  if (existing) {
-    // Already marked today
+function renderAttendanceContent(record) {
+  const el = document.getElementById('attendanceContent'); if (!el) return
+
+  if (record) {
+    // Already has a record
+    const statusConf = {
+      present: { cls:'sr-present', icon:'✅', label:'Present', color:'var(--green)' },
+      late:    { cls:'sr-late',    icon:'🕐', label:'Late',    color:'var(--amber)' },
+      absent:  { cls:'sr-absent',  icon:'❌', label:'Absent',  color:'var(--red)'   },
+      on_leave:{ cls:'sr-leave',   icon:'🏖', label:'On Leave',color:'var(--blue)'  },
+    }
+    const sc = statusConf[record.status] || statusConf.present
+    const checkedOut = !!record.check_out_time
+
     el.innerHTML = `
-      <div class="already-checkedin">
-        <div class="big">✅</div>
-        <div class="time">${existing.status === 'on_leave' ? '🏖 On Leave' : existing.status === 'absent' ? '❌ Absent' : fmt12(existing.check_in_time)}</div>
-        <div class="label">${existing.status === 'present' || existing.status === 'late' ? 'Checked in today' : 'Status recorded'}</div>
-        ${existing.note ? `<div style="margin-top:8px;font-size:12px;color:var(--text2);">"${existing.note}"</div>` : ''}
+      <div class="status-result ${sc.cls}">
+        <div class="sr-icon">${sc.icon}</div>
+        <div class="sr-status" style="color:${sc.color};">${sc.label}</div>
+        <div class="sr-time">Checked in at ${fmt12(record.check_in_time)}${checkedOut ? ` · Out at ${fmt12(record.check_out_time)}` : ''}</div>
+        ${record.note ? `<div style="font-size:12px;opacity:0.65;margin-top:4px;">"${record.note}"</div>` : ''}
       </div>
-      <div style="font-size:12px;color:var(--text3);text-align:center;padding:8px 0;">
-        Today's attendance has been recorded. Contact your admin if there's an error.
-      </div>
+
+      ${!checkedOut && (record.status === 'present' || record.status === 'late') ? `
+        <button class="btn btn-amber btn-full" onclick="doCheckOut('${record.id}')">
+          🚪 Check out
+        </button>
+        <div style="font-size:11.5px;color:var(--text3);text-align:center;margin-top:8px;">
+          Tap when leaving for the day
+        </div>
+      ` : checkedOut ? `
+        <div style="text-align:center;font-size:12.5px;color:var(--text3);padding:8px 0;">
+          You have checked out. See you tomorrow! 👋
+        </div>
+      ` : ''}
     `
   } else {
+    // No record yet — show check-in options
     el.innerHTML = `
-      <div style="font-size:13px;font-weight:600;color:var(--text2);margin-bottom:10px;">Select your status for today</div>
-      <div class="status-grid">
-        <div class="status-option" id="opt-present" onclick="selectStatus('present')">
-          <div class="status-icon">✅</div>
-          <div class="status-label">Present</div>
+      <div style="font-size:13px;font-weight:600;color:var(--text2);margin-bottom:10px;">Mark your attendance for today</div>
+      <div class="status-options" id="statusOpts">
+        <div class="status-opt" id="opt-present" onclick="pickStatus('present')">
+          <div class="so-icon">✅</div><div class="so-label">Present</div>
         </div>
-        <div class="status-option" id="opt-late" onclick="selectStatus('late')">
-          <div class="status-icon">🕐</div>
-          <div class="status-label">Late</div>
+        <div class="status-opt" id="opt-late" onclick="pickStatus('late')">
+          <div class="so-icon">🕐</div><div class="so-label">Late</div>
         </div>
-        <div class="status-option" id="opt-on_leave" onclick="selectStatus('on_leave')">
-          <div class="status-icon">🏖</div>
-          <div class="status-label">On Leave</div>
+        <div class="status-opt" id="opt-on_leave" onclick="pickStatus('on_leave')">
+          <div class="so-icon">🏖</div><div class="so-label">On Leave</div>
         </div>
-        <div class="status-option" id="opt-absent" onclick="selectStatus('absent')">
-          <div class="status-icon">❌</div>
-          <div class="status-label">Absent</div>
+        <div class="status-opt" id="opt-absent" onclick="pickStatus('absent')">
+          <div class="so-icon">❌</div><div class="so-label">Absent</div>
         </div>
       </div>
-      <div class="field-group" style="margin-bottom:14px;">
+      <div class="fg">
         <label class="field-label">Note (optional)</label>
-        <textarea id="checkinNote" placeholder="e.g. Doctor's appointment, working from home…" style="min-height:60px;"></textarea>
+        <textarea id="ciNote" placeholder="e.g. Working from home, doctor's appointment…" style="min-height:55px;"></textarea>
       </div>
-      <button class="btn btn-primary" id="checkinSubmitBtn" onclick="submitCheckin()" disabled>Mark Attendance</button>
+      <button class="btn btn-primary btn-full" id="ciBtn" onclick="doCheckIn()" disabled>
+        ✅ Check in
+      </button>
     `
   }
 }
 
-let selectedStatus = null
-window.selectStatus = function(s) {
-  selectedStatus = s
-  const colorMap = { present: 'selected-green', late: 'selected-amber', on_leave: 'selected-orange', absent: 'selected-red' }
+let pickedStatus = null
+window.pickStatus = function(s) {
+  pickedStatus = s
+  const colorMap = { present:'sel-present', late:'sel-late', on_leave:'sel-leave', absent:'sel-absent' }
   ;['present','late','on_leave','absent'].forEach(k => {
     const el = document.getElementById('opt-' + k)
-    if (el) el.className = 'status-option' + (k === s ? ' ' + colorMap[k] : '')
+    if (el) el.className = 'status-opt' + (k === s ? ' ' + colorMap[k] : '')
   })
-  const btn = document.getElementById('checkinSubmitBtn')
-  if (btn) btn.disabled = false
+  const btn = document.getElementById('ciBtn')
+  if (btn) { btn.disabled = false }
 }
 
-window.submitCheckin = async function() {
-  if (!selectedStatus) return
-  const btn  = document.getElementById('checkinSubmitBtn')
-  const note = document.getElementById('checkinNote')?.value?.trim() || null
+window.doCheckIn = async function() {
+  if (!pickedStatus) return
+  const btn  = document.getElementById('ciBtn')
+  const note = document.getElementById('ciNote')?.value?.trim() || null
   btn.disabled = true; btn.textContent = 'Saving…'
+
+  const checkInTime = new Date().toISOString()
+  // Auto-detect late based on office time
+  let finalStatus = pickedStatus
+  if (pickedStatus === 'present' && isLate(checkInTime)) finalStatus = 'late'
 
   const row = {
     member_id:    currentUser.id,
     member_name:  currentUser.name,
     date:         todayStr(),
-    check_in_time: ['present','late'].includes(selectedStatus) ? nowStr() : null,
-    status:       selectedStatus,
+    check_in_time: (pickedStatus === 'present' || pickedStatus === 'late') ? checkInTime : null,
+    status:       finalStatus,
     note,
     marked_by:    'self',
   }
   const { error } = await supabase.from('attendance').insert(row)
-  if (error) { toast('Error saving attendance', 'error'); btn.disabled = false; btn.textContent = 'Mark Attendance'; return }
+  if (error) { toast('Error saving — try again', 'error'); btn.disabled = false; btn.textContent = '✅ Check in'; return }
   toast('Attendance recorded ✓', 'success')
-  await renderMemberCheckin()
+  // Re-fetch and re-render
+  const { data: record } = await supabase.from('attendance')
+    .select('*').eq('member_id', currentUser.id).eq('date', todayStr()).single()
+  renderAttendanceContent(record)
+}
+
+window.doCheckOut = async function(id) {
+  const checkOutTime = new Date().toISOString()
+  const { error } = await supabase.from('attendance').update({ check_out_time: checkOutTime }).eq('id', id)
+  if (error) { toast('Error saving check-out', 'error'); return }
+  toast('Checked out ✓', 'success')
+  const { data: record } = await supabase.from('attendance')
+    .select('*').eq('member_id', currentUser.id).eq('date', todayStr()).single()
+  renderAttendanceContent(record)
 }
 
 // ─── ADMIN SHELL ──────────────────────────────────────────────
 function renderAdmin() {
   document.getElementById('app').innerHTML = `
-    <div class="app-shell">
-      <aside class="sidebar">
-        <div class="sidebar-logo">
-          <div class="sidebar-logo-row">
-            <div class="sidebar-logo-icon">🕐</div>
-            <div>
-              <div class="sidebar-logo-title">Freelance HQ</div>
-              <div class="sidebar-logo-sub">attendance</div>
-            </div>
-          </div>
-        </div>
-        <div class="nav-section">Admin</div>
-        <div class="nav-item active" data-view="dashboard" onclick="switchView('dashboard')">
-          <svg class="nav-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="1" y="1" width="6" height="6" rx="1"/><rect x="9" y="1" width="6" height="6" rx="1"/><rect x="1" y="9" width="6" height="6" rx="1"/><rect x="9" y="9" width="6" height="6" rx="1"/></svg>
-          Dashboard
-        </div>
-        <div class="nav-item" data-view="attendance" onclick="switchView('attendance')">
-          <svg class="nav-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="2" y="3" width="12" height="11" rx="1.5"/><path d="M5 1v4M11 1v4M2 7h12"/></svg>
-          Attendance
-        </div>
-        <div class="nav-item" data-view="performance" onclick="switchView('performance')">
-          <svg class="nav-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M2 12 L5 8 L8 10 L11 5 L14 7"/></svg>
-          Performance
-        </div>
-        <div class="nav-item" data-view="members" onclick="switchView('members')">
-          <svg class="nav-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="6" cy="5" r="3"/><path d="M1 14c0-3 2.5-4.5 5-4.5s5 1.5 5 4.5"/><path d="M11 7c2 0 4 1 4 4"/><circle cx="12" cy="4" r="2"/></svg>
-          Members
-        </div>
-        <div class="sidebar-user">
-          <div class="user-name">${currentUser.name}</div>
-          <div class="user-role">admin</div>
-          <button class="logout-btn" onclick="doLogout()">Sign out</button>
-        </div>
-      </aside>
-      <main class="main">
-        <div class="view active" id="view-dashboard"></div>
-        <div class="view" id="view-attendance"></div>
-        <div class="view" id="view-performance"></div>
-        <div class="view" id="view-members"></div>
-      </main>
-    </div>
-
-    <!-- ADD MEMBER MODAL -->
-    <div class="modal-overlay" id="addMemberModal" style="display:none;">
-      <div class="modal">
-        <div class="modal-title">Add team member</div>
-        <div class="two-col">
-          <div class="field-group-m"><label class="field-label">Full name</label><input type="text" id="am-name" placeholder="e.g. Hamza Khan" /></div>
-          <div class="field-group-m"><label class="field-label">Username</label><input type="text" id="am-username" placeholder="e.g. hamza" /></div>
-          <div class="field-group-m"><label class="field-label">Password</label><input type="password" id="am-pass" placeholder="min 6 characters" /></div>
-          <div class="field-group-m"><label class="field-label">Role</label>
-            <select id="am-role"><option value="member">Member</option><option value="admin">Admin</option></select>
-          </div>
-        </div>
-        <div class="modal-actions">
-          <button class="btn btn-ghost" onclick="closeAddMember()">Cancel</button>
-          <button class="btn btn-primary" onclick="saveAddMember()">Add member</button>
+  <div class="app-shell">
+    <aside class="sidebar">
+      <div class="sb-logo">
+        <div class="sb-logo-icon">⏱</div>
+        <div>
+          <div class="sb-logo-name">Haazri HQ</div>
+          <div class="sb-logo-sub">admin panel</div>
         </div>
       </div>
-    </div>
+      <div class="nav-sec">Overview</div>
+      <div class="nav-item active" data-view="dashboard" onclick="go('dashboard')">
+        <svg class="nav-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="1" y="1" width="6" height="6" rx="1"/><rect x="9" y="1" width="6" height="6" rx="1"/><rect x="1" y="9" width="6" height="6" rx="1"/><rect x="9" y="9" width="6" height="6" rx="1"/></svg>
+        Dashboard
+      </div>
+      <div class="nav-sec">Records</div>
+      <div class="nav-item" data-view="attendance" onclick="go('attendance')">
+        <svg class="nav-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="2" y="3" width="12" height="11" rx="1.5"/><path d="M5 1v4M11 1v4M2 7h12"/></svg>
+        Attendance
+      </div>
+      <div class="nav-item" data-view="performance" onclick="go('performance')">
+        <svg class="nav-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M2 12L5 8L8 10L11 5L14 7"/></svg>
+        Performance
+      </div>
+      <div class="nav-sec">Admin</div>
+      <div class="nav-item" data-view="members" onclick="go('members')">
+        <svg class="nav-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="6" cy="5" r="3"/><path d="M1 14c0-3 2.5-4.5 5-4.5s5 1.5 5 4.5"/><circle cx="12" cy="5" r="2"/><path d="M11 12c1.5 0 4 .8 4 3"/></svg>
+        Members
+      </div>
+      <div class="nav-item" data-view="settings" onclick="go('settings')">
+        <svg class="nav-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="8" cy="8" r="2.5"/><path d="M8 2v1M8 13v1M2 8h1M13 8h1M3.5 3.5l.7.7M11.8 11.8l.7.7M3.5 12.5l.7-.7M11.8 4.2l.7-.7"/></svg>
+        Settings
+      </div>
+      <div class="sb-footer">
+        <div class="sb-user-name">${currentUser.name}</div>
+        <div class="sb-user-role">${currentUser.role}</div>
+        <button class="sb-logout" onclick="doLogout()">Sign out</button>
+      </div>
+    </aside>
+    <main class="main">
+      <div class="view active" id="view-dashboard"></div>
+      <div class="view" id="view-attendance"></div>
+      <div class="view" id="view-performance"></div>
+      <div class="view" id="view-members"></div>
+      <div class="view" id="view-settings"></div>
+    </main>
+  </div>
 
-    <!-- EDIT ATTENDANCE MODAL -->
-    <div class="modal-overlay" id="editAttModal" style="display:none;">
-      <div class="modal">
-        <div class="modal-title">Edit attendance record</div>
-        <input type="hidden" id="ea-id" />
-        <div class="two-col">
-          <div class="field-group-m full"><label class="field-label">Member</label><input type="text" id="ea-member" disabled /></div>
-          <div class="field-group-m"><label class="field-label">Date</label><input type="date" id="ea-date" /></div>
-          <div class="field-group-m"><label class="field-label">Status</label>
-            <select id="ea-status">
-              <option value="present">✅ Present</option>
-              <option value="late">🕐 Late</option>
-              <option value="on_leave">🏖 On Leave</option>
-              <option value="absent">❌ Absent</option>
-            </select>
-          </div>
-          <div class="field-group-m"><label class="field-label">Check-in time</label><input type="time" id="ea-checkin" /></div>
-          <div class="field-group-m full"><label class="field-label">Note</label><textarea id="ea-note" style="min-height:60px;"></textarea></div>
-        </div>
-        <div class="modal-actions">
-          <button class="btn btn-ghost" onclick="closeEditAtt()">Cancel</button>
-          <button class="btn btn-primary" onclick="saveEditAtt()">Save</button>
+  <!-- ADD MEMBER MODAL -->
+  <div class="modal-overlay" id="addMemberModal" style="display:none;">
+    <div class="modal">
+      <div class="modal-title">Add team member</div>
+      <div class="two-col">
+        <div class="fg"><label class="field-label">Full name</label><input type="text" id="am-name" placeholder="Hamza Khan" /></div>
+        <div class="fg"><label class="field-label">Username</label><input type="text" id="am-user" placeholder="hamza" /></div>
+        <div class="fg"><label class="field-label">Password</label><input type="password" id="am-pass" placeholder="min 6 chars" /></div>
+        <div class="fg"><label class="field-label">Role</label>
+          <select id="am-role">
+            <option value="member">Member</option>
+            ${isSuperAdmin() ? '<option value="admin">Admin</option>' : ''}
+          </select>
         </div>
       </div>
-    </div>
-
-    <!-- MANUAL ATTENDANCE MODAL -->
-    <div class="modal-overlay" id="manualAttModal" style="display:none;">
-      <div class="modal">
-        <div class="modal-title">Mark attendance manually</div>
-        <div class="two-col">
-          <div class="field-group-m"><label class="field-label">Member</label>
-            <select id="ma-member"></select>
-          </div>
-          <div class="field-group-m"><label class="field-label">Date</label><input type="date" id="ma-date" /></div>
-          <div class="field-group-m"><label class="field-label">Status</label>
-            <select id="ma-status">
-              <option value="present">✅ Present</option>
-              <option value="late">🕐 Late</option>
-              <option value="on_leave">🏖 On Leave</option>
-              <option value="absent">❌ Absent</option>
-            </select>
-          </div>
-          <div class="field-group-m"><label class="field-label">Check-in time (optional)</label><input type="time" id="ma-checkin" /></div>
-          <div class="field-group-m full"><label class="field-label">Note</label><textarea id="ma-note" style="min-height:50px;"></textarea></div>
-        </div>
-        <div class="modal-actions">
-          <button class="btn btn-ghost" onclick="closeManualAtt()">Cancel</button>
-          <button class="btn btn-primary" onclick="saveManualAtt()">Mark attendance</button>
-        </div>
+      <div class="modal-actions">
+        <button class="btn btn-ghost" onclick="closeM('addMemberModal')">Cancel</button>
+        <button class="btn btn-primary" onclick="saveNewMember()">Add member</button>
       </div>
     </div>
+  </div>
 
-    <div class="toast" id="toast"></div>
-  `
-  switchView('dashboard')
+  <!-- EDIT ATTENDANCE MODAL -->
+  <div class="modal-overlay" id="editAttModal" style="display:none;">
+    <div class="modal">
+      <div class="modal-title">Edit attendance record</div>
+      <input type="hidden" id="ea-id" />
+      <div class="two-col">
+        <div class="fg full"><label class="field-label">Member</label><input id="ea-mem" disabled /></div>
+        <div class="fg"><label class="field-label">Date</label><input type="date" id="ea-date" /></div>
+        <div class="fg"><label class="field-label">Status</label>
+          <select id="ea-status">
+            <option value="present">✅ Present</option>
+            <option value="late">🕐 Late</option>
+            <option value="on_leave">🏖 On Leave</option>
+            <option value="absent">❌ Absent</option>
+          </select>
+        </div>
+        <div class="fg"><label class="field-label">Check-in time</label><input type="time" id="ea-cin" /></div>
+        <div class="fg"><label class="field-label">Check-out time</label><input type="time" id="ea-cout" /></div>
+        <div class="fg full"><label class="field-label">Note</label><textarea id="ea-note" style="min-height:55px;"></textarea></div>
+      </div>
+      <div class="modal-actions">
+        <button class="btn btn-ghost" onclick="closeM('editAttModal')">Cancel</button>
+        <button class="btn btn-primary" onclick="saveEditAtt()">Save changes</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- MANUAL ATTENDANCE MODAL -->
+  <div class="modal-overlay" id="manualAttModal" style="display:none;">
+    <div class="modal">
+      <div class="modal-title">Mark attendance manually</div>
+      <div class="two-col">
+        <div class="fg"><label class="field-label">Member</label><select id="ma-mem"></select></div>
+        <div class="fg"><label class="field-label">Date</label><input type="date" id="ma-date" /></div>
+        <div class="fg"><label class="field-label">Status</label>
+          <select id="ma-status">
+            <option value="present">✅ Present</option>
+            <option value="late">🕐 Late</option>
+            <option value="on_leave">🏖 On Leave</option>
+            <option value="absent">❌ Absent</option>
+          </select>
+        </div>
+        <div class="fg"><label class="field-label">Check-in time (optional)</label><input type="time" id="ma-cin" /></div>
+        <div class="fg full"><label class="field-label">Note</label><textarea id="ma-note" style="min-height:50px;"></textarea></div>
+      </div>
+      <div class="modal-actions">
+        <button class="btn btn-ghost" onclick="closeM('manualAttModal')">Cancel</button>
+        <button class="btn btn-primary" onclick="saveManualAtt()">Mark attendance</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="toast" id="_toast"></div>`
+
+  go('dashboard')
 }
 
-window.switchView = function(v) {
+window.go = function(v) {
   adminView = v
   document.querySelectorAll('.view').forEach(el => el.classList.remove('active'))
   document.getElementById('view-' + v)?.classList.add('active')
   document.querySelectorAll('.nav-item[data-view]').forEach(el => el.classList.toggle('active', el.dataset.view === v))
-  if (v === 'dashboard')   renderDashboard()
-  if (v === 'attendance')  renderAttendanceView()
-  if (v === 'performance') renderPerformanceView()
-  if (v === 'members')     renderMembersView()
+  if (v === 'dashboard')   loadDashboard()
+  if (v === 'attendance')  loadAttendance()
+  if (v === 'performance') loadPerformance()
+  if (v === 'members')     loadMembers()
+  if (v === 'settings')    loadSettings()
 }
 
+window.closeM = id => { document.getElementById(id).style.display = 'none' }
 window.toggleMenu = function(e, id) {
   e.stopPropagation()
   document.querySelectorAll('.action-menu.open').forEach(m => { if (m.id !== id) m.classList.remove('open') })
@@ -414,444 +463,448 @@ window.toggleMenu = function(e, id) {
 document.addEventListener('click', () => document.querySelectorAll('.action-menu.open').forEach(m => m.classList.remove('open')))
 
 // ─── DASHBOARD ────────────────────────────────────────────────
-async function renderDashboard() {
+async function loadDashboard() {
   const el = document.getElementById('view-dashboard')
-  el.innerHTML = `<div class="page-header"><div><div class="page-title">Dashboard</div><div class="page-sub">Today's snapshot · ${new Date().toLocaleDateString('en-GB', { weekday:'long', day:'2-digit', month:'long', year:'numeric' })}</div></div><button class="btn btn-ghost btn-sm" onclick="openManualAtt()">+ Mark manually</button></div><div id="dashContent"><div class="loading"><div class="spinner"></div> Loading…</div></div>`
+  const today = todayStr()
+  el.innerHTML = `<div class="page-header"><div><div class="page-title">Dashboard</div><div class="page-sub">${new Date().toLocaleDateString('en-US',{weekday:'long',day:'numeric',month:'long',year:'numeric'})}</div></div><button class="btn btn-ghost btn-sm" onclick="openManualAtt()">+ Mark manually</button></div><div class="loading"><div class="spinner"></div> Loading…</div>`
 
-  const today   = todayStr()
-  const [membRes, attRes] = await Promise.all([
-    supabase.from('members').select('*').eq('active', true).neq('role', 'admin'),
+  const [{ data: members }, { data: att }] = await Promise.all([
+    supabase.from('members').select('*').eq('active',true).neq('role','superadmin').neq('role','admin'),
     supabase.from('attendance').select('*').eq('date', today)
   ])
-  const members    = membRes.data || []
-  const todayAtt   = attRes.data  || []
-  const present    = todayAtt.filter(a => a.status === 'present').length
-  const late       = todayAtt.filter(a => a.status === 'late').length
-  const onLeave    = todayAtt.filter(a => a.status === 'on_leave').length
-  const absent     = todayAtt.filter(a => a.status === 'absent').length
-  const notMarked  = members.filter(m => !todayAtt.find(a => a.member_id === m.id)).length
-
-  document.getElementById('dashContent').innerHTML = `
-    <div class="stat-grid">
-      <div class="stat-box sb-green"><div class="stat-label">Present</div><div class="stat-value" style="color:var(--green)">${present}</div></div>
-      <div class="stat-box sb-amber"><div class="stat-label">Late</div><div class="stat-value" style="color:var(--amber)">${late}</div></div>
-      <div class="stat-box sb-blue"><div class="stat-label">On Leave</div><div class="stat-value" style="color:var(--blue)">${onLeave}</div></div>
-      <div class="stat-box sb-red"><div class="stat-label">Absent</div><div class="stat-value" style="color:var(--red)">${absent}</div></div>
-      <div class="stat-box sb-purple"><div class="stat-label">Not marked</div><div class="stat-value" style="color:var(--accent)">${notMarked}</div></div>
-      <div class="stat-box"><div class="stat-label">Total members</div><div class="stat-value">${members.length}</div></div>
-    </div>
-
-    <div class="card">
-      <div class="card-header"><span class="card-title">Today — ${today}</span></div>
-      <div class="table-wrap"><table>
-        <thead><tr><th>Member</th><th>Status</th><th>Check-in</th><th>Note</th><th>Marked by</th></tr></thead>
-        <tbody>
-          ${members.map(m => {
-            const a = todayAtt.find(x => x.member_id === m.id)
-            return `<tr>
-              <td><div style="display:flex;align-items:center;gap:9px;"><div style="width:28px;height:28px;border-radius:50%;background:var(--purple-bg);color:#a090f8;display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:700;border:1px solid var(--purple-border);flex-shrink:0;">${initials(m.name)}</div>${m.name}</div></td>
-              <td>${a ? statusBadge(a.status) : '<span style="color:var(--text3);font-size:12px;">Not marked</span>'}</td>
-              <td style="font-family:var(--mono);font-size:12px;">${a ? fmt12(a.check_in_time) : '—'}</td>
-              <td style="font-size:12px;color:var(--text2);">${a?.note || '—'}</td>
-              <td style="font-size:12px;color:var(--text3);">${a?.marked_by || '—'}</td>
-            </tr>`
-          }).join('')}
-        </tbody>
-      </table></div>
-    </div>
-  `
-}
-
-// ─── ATTENDANCE VIEW ──────────────────────────────────────────
-async function renderAttendanceView(filters = {}) {
-  const el = document.getElementById('view-attendance')
-  const today = todayStr()
-  const weekAgo = new Date(Date.now() - 7 * 86400000).toISOString().slice(0, 10)
-  const from = filters.from || weekAgo
-  const to   = filters.to   || today
-  const memberFilter = filters.member || ''
-
-  const { data: members } = await supabase.from('members').select('*').eq('active', true).neq('role', 'admin')
+  const present   = att?.filter(a=>a.status==='present').length  || 0
+  const late      = att?.filter(a=>a.status==='late').length     || 0
+  const onLeave   = att?.filter(a=>a.status==='on_leave').length || 0
+  const absent    = att?.filter(a=>a.status==='absent').length   || 0
+  const notMarked = (members||[]).filter(m => !att?.find(a=>a.member_id===m.id)).length
 
   el.innerHTML = `
     <div class="page-header">
-      <div><div class="page-title">Attendance</div><div class="page-sub">Full attendance log with date range filter</div></div>
-      <div style="display:flex;gap:8px;">
-        <button class="btn btn-ghost btn-sm" onclick="exportAttendanceCSV()">⬇ Export CSV</button>
+      <div><div class="page-title">Dashboard</div><div class="page-sub">${new Date().toLocaleDateString('en-US',{weekday:'long',day:'numeric',month:'long',year:'numeric'})}</div></div>
+      <button class="btn btn-ghost btn-sm" onclick="openManualAtt()">+ Mark manually</button>
+    </div>
+    <div class="stat-grid">
+      <div class="stat-box"><div class="stat-box-accent" style="background:var(--green)"></div><div class="stat-label">Present</div><div class="stat-value" style="color:var(--green)">${present}</div></div>
+      <div class="stat-box"><div class="stat-box-accent" style="background:var(--amber)"></div><div class="stat-label">Late</div><div class="stat-value" style="color:var(--amber)">${late}</div></div>
+      <div class="stat-box"><div class="stat-box-accent" style="background:var(--blue)"></div><div class="stat-label">On Leave</div><div class="stat-value" style="color:var(--blue)">${onLeave}</div></div>
+      <div class="stat-box"><div class="stat-box-accent" style="background:var(--red)"></div><div class="stat-label">Absent</div><div class="stat-value" style="color:var(--red)">${absent}</div></div>
+      <div class="stat-box"><div class="stat-box-accent" style="background:var(--teal)"></div><div class="stat-label">Not marked</div><div class="stat-value" style="color:var(--teal)">${notMarked}</div></div>
+      <div class="stat-box"><div class="stat-box-accent" style="background:var(--text3)"></div><div class="stat-label">Total</div><div class="stat-value">${(members||[]).length}</div></div>
+    </div>
+    <div class="card">
+      <div class="card-hdr"><span class="card-title">Today · ${today}</span></div>
+      <div class="table-wrap"><table>
+        <thead><tr><th>Member</th><th>Status</th><th>Check-in</th><th>Check-out</th><th>Note</th><th>By</th></tr></thead>
+        <tbody>${(members||[]).map(m=>{
+          const a = att?.find(x=>x.member_id===m.id)
+          return `<tr>
+            <td><div style="display:flex;align-items:center;gap:9px;"><div class="avatar-sm">${initials(m.name)}</div>${m.name}</div></td>
+            <td>${a ? statusBadge(a.status) : '<span style="color:var(--text3);font-size:12px;">—</span>'}</td>
+            <td style="font-family:var(--mono);font-size:12px;">${a ? fmt12(a.check_in_time) : '—'}</td>
+            <td style="font-family:var(--mono);font-size:12px;">${a ? fmt12(a.check_out_time) : '—'}</td>
+            <td style="font-size:12px;color:var(--text2);">${a?.note||'—'}</td>
+            <td style="font-size:12px;color:var(--text3);">${a?.marked_by||'—'}</td>
+          </tr>`
+        }).join('')}</tbody>
+      </table></div>
+    </div>`
+}
+
+// ─── ATTENDANCE ───────────────────────────────────────────────
+async function loadAttendance(f={}) {
+  const el    = document.getElementById('view-attendance')
+  const today = todayStr()
+  const from  = f.from  || new Date(Date.now()-7*86400000).toISOString().slice(0,10)
+  const to    = f.to    || today
+  const memF  = f.mem   || ''
+
+  const { data: members } = await supabase.from('members').select('*').eq('active',true).neq('role','superadmin').neq('role','admin')
+
+  el.innerHTML = `
+    <div class="page-header">
+      <div><div class="page-title">Attendance log</div><div class="page-sub">Full history with date range filter</div></div>
+      <div class="btn-row">
+        <button class="btn btn-ghost btn-sm" onclick="exportAttCSV()">⬇ CSV</button>
         <button class="btn btn-ghost btn-sm" onclick="openManualAtt()">+ Mark manually</button>
       </div>
     </div>
     <div class="card">
       <div class="filters-row">
-        <div class="field-group">
-          <label class="filter-label">From</label>
-          <input type="date" id="att-from" value="${from}" style="max-width:150px;" />
-        </div>
-        <div class="field-group">
-          <label class="filter-label">To</label>
-          <input type="date" id="att-to" value="${to}" style="max-width:150px;" />
-        </div>
-        <div class="field-group">
-          <label class="filter-label">Member</label>
-          <select id="att-member" style="max-width:160px;">
+        <div class="fg"><label class="field-label">From</label><input type="date" id="af-from" value="${from}" style="max-width:148px;" /></div>
+        <div class="fg"><label class="field-label">To</label><input type="date" id="af-to" value="${to}" style="max-width:148px;" /></div>
+        <div class="fg"><label class="field-label">Member</label>
+          <select id="af-mem" style="max-width:160px;">
             <option value="">All members</option>
-            ${(members||[]).map(m => `<option value="${m.id}" ${memberFilter===m.id?'selected':''}>${m.name}</option>`).join('')}
+            ${(members||[]).map(m=>`<option value="${m.id}" ${memF===m.id?'selected':''}>${m.name}</option>`).join('')}
           </select>
         </div>
         <button class="btn btn-ghost btn-sm" onclick="applyAttFilters()" style="align-self:flex-end;">Apply</button>
       </div>
-      <div id="attTableWrap"><div class="loading"><div class="spinner"></div> Loading…</div></div>
-    </div>
-  `
-  loadAttendanceTable(from, to, memberFilter)
+      <div id="attTbl"><div class="loading"><div class="spinner"></div> Loading…</div></div>
+    </div>`
+  fillAttTable(from, to, memF)
 }
 
-window.applyAttFilters = function() {
-  const from   = document.getElementById('att-from')?.value
-  const to     = document.getElementById('att-to')?.value
-  const member = document.getElementById('att-member')?.value
-  loadAttendanceTable(from, to, member)
-}
+window.applyAttFilters = () => fillAttTable(
+  document.getElementById('af-from')?.value,
+  document.getElementById('af-to')?.value,
+  document.getElementById('af-mem')?.value
+)
 
-async function loadAttendanceTable(from, to, memberFilter) {
-  const el = document.getElementById('attTableWrap')
-  let q = supabase.from('attendance').select('*').gte('date', from).lte('date', to).order('date', { ascending: false }).order('member_name')
-  if (memberFilter) q = q.eq('member_id', memberFilter)
-  const { data } = await q
-  const rows = data || []
-  el.innerHTML = rows.length
-    ? `<div class="table-wrap"><table>
-        <thead><tr><th>Date</th><th>Member</th><th>Status</th><th>Check-in</th><th>Note</th><th>Marked by</th><th></th></tr></thead>
-        <tbody>${rows.map(r => `<tr>
-          <td style="font-family:var(--mono);font-size:12px;">${fmtShortDate(r.date)}</td>
-          <td>${r.member_name}</td>
-          <td>${statusBadge(r.status)}</td>
-          <td style="font-family:var(--mono);font-size:12px;">${fmt12(r.check_in_time)}</td>
-          <td style="font-size:12px;color:var(--text2);max-width:160px;">${r.note||'—'}</td>
-          <td style="font-size:12px;color:var(--text3);">${r.marked_by||'—'}</td>
-          <td>
-            <div class="action-menu-wrap">
-              <button class="btn-action" onclick="toggleMenu(event,'amenu-${r.id}')">•••</button>
-              <div class="action-menu" id="amenu-${r.id}">
-                <div class="action-item" onclick="openEditAtt('${r.id}')">✏ Edit</div>
-                <div class="action-item action-item-danger" onclick="deleteAtt('${r.id}')">🗑 Delete</div>
-              </div>
+async function fillAttTable(from, to, memF) {
+  let q = supabase.from('attendance').select('*').gte('date',from).lte('date',to).order('date',{ascending:false})
+  if (memF) q = q.eq('member_id', memF)
+  const { data: rows } = await q
+  const el = document.getElementById('attTbl')
+  if (!el) return
+  el.innerHTML = (rows||[]).length ? `
+    <div class="table-wrap"><table>
+      <thead><tr><th>Date</th><th>Member</th><th>Status</th><th>Check-in</th><th>Check-out</th><th>Note</th><th>By</th><th></th></tr></thead>
+      <tbody>${(rows||[]).map(r=>`<tr>
+        <td style="font-family:var(--mono);font-size:12px;">${fmtShort(r.date)}</td>
+        <td>${r.member_name}</td>
+        <td>${statusBadge(r.status)}</td>
+        <td style="font-family:var(--mono);font-size:12px;">${fmt12(r.check_in_time)}</td>
+        <td style="font-family:var(--mono);font-size:12px;">${fmt12(r.check_out_time)}</td>
+        <td style="font-size:12px;color:var(--text2);max-width:150px;">${r.note||'—'}</td>
+        <td style="font-size:12px;color:var(--text3);">${r.marked_by||'—'}</td>
+        <td>
+          <div class="action-menu-wrap">
+            <button class="btn-action" onclick="toggleMenu(event,'ra-${r.id}')">•••</button>
+            <div class="action-menu" id="ra-${r.id}">
+              <div class="action-item" onclick="openEditAtt('${r.id}')">✏ Edit</div>
+              <div class="action-item action-item-danger" onclick="delAtt('${r.id}')">🗑 Delete</div>
             </div>
-          </td>
-        </tr>`).join('')}</tbody>
-      </table></div>`
-    : '<div class="empty">No attendance records found for this period.</div>'
+          </div>
+        </td>
+      </tr>`).join('')}</tbody>
+    </table></div>` : '<div class="empty">No records for this period.</div>'
 }
 
-// ─── PERFORMANCE VIEW ─────────────────────────────────────────
-async function renderPerformanceView(filters = {}) {
-  const el = document.getElementById('view-performance')
-  const today   = todayStr()
-  const monthStart = today.slice(0, 8) + '01'
-  const from = filters.from || monthStart
-  const to   = filters.to   || today
+// ─── PERFORMANCE ──────────────────────────────────────────────
+async function loadPerformance(f={}) {
+  const el    = document.getElementById('view-performance')
+  const today = todayStr()
+  const from  = f.from || today.slice(0,8)+'01'
+  const to    = f.to   || today
 
   el.innerHTML = `
     <div class="page-header">
-      <div><div class="page-title">Performance</div><div class="page-sub">Attendance statistics per team member</div></div>
-      <button class="btn btn-ghost btn-sm" onclick="exportPerformanceCSV()">⬇ Export CSV</button>
+      <div><div class="page-title">Performance</div><div class="page-sub">Attendance statistics by member and date range</div></div>
+      <button class="btn btn-ghost btn-sm" onclick="exportPerfCSV()">⬇ CSV</button>
     </div>
     <div class="card">
       <div class="filters-row">
-        <div class="field-group">
-          <label class="filter-label">From</label>
-          <input type="date" id="perf-from" value="${from}" style="max-width:150px;" />
-        </div>
-        <div class="field-group">
-          <label class="filter-label">To</label>
-          <input type="date" id="perf-to" value="${to}" style="max-width:150px;" />
-        </div>
+        <div class="fg"><label class="field-label">From</label><input type="date" id="pf-from" value="${from}" style="max-width:148px;" /></div>
+        <div class="fg"><label class="field-label">To</label><input type="date" id="pf-to" value="${to}" style="max-width:148px;" /></div>
         <button class="btn btn-ghost btn-sm" onclick="applyPerfFilters()" style="align-self:flex-end;">Apply</button>
       </div>
-      <div id="perfContent"><div class="loading"><div class="spinner"></div> Loading…</div></div>
-    </div>
-  `
-  loadPerformanceData(from, to)
+      <div id="perfRows"><div class="loading"><div class="spinner"></div> Loading…</div></div>
+    </div>`
+  fillPerfRows(from, to)
 }
 
-window.applyPerfFilters = function() {
-  const from = document.getElementById('perf-from')?.value
-  const to   = document.getElementById('perf-to')?.value
-  loadPerformanceData(from, to)
-}
+window.applyPerfFilters = () => fillPerfRows(
+  document.getElementById('pf-from')?.value,
+  document.getElementById('pf-to')?.value
+)
 
-async function loadPerformanceData(from, to) {
-  const el = document.getElementById('perfContent')
-  const [membRes, attRes] = await Promise.all([
-    supabase.from('members').select('*').eq('active', true).neq('role', 'admin'),
-    supabase.from('attendance').select('*').gte('date', from).lte('date', to)
+async function fillPerfRows(from, to) {
+  const [{ data: members }, { data: att }] = await Promise.all([
+    supabase.from('members').select('*').eq('active',true).neq('role','superadmin').neq('role','admin'),
+    supabase.from('attendance').select('*').gte('date',from).lte('date',to)
   ])
-  const members = membRes.data || []
-  const att     = attRes.data  || []
-
-  // Calculate days in range
   const d1 = new Date(from), d2 = new Date(to)
-  const totalDays = Math.max(1, Math.round((d2 - d1) / 86400000) + 1)
+  const totalDays = Math.max(1, Math.round((d2-d1)/86400000)+1)
+  const el = document.getElementById('perfRows'); if (!el) return
 
-  const rows = members.map(m => {
-    const ma = att.filter(a => a.member_id === m.id)
-    const present  = ma.filter(a => a.status === 'present').length
-    const late     = ma.filter(a => a.status === 'late').length
-    const onLeave  = ma.filter(a => a.status === 'on_leave').length
-    const absent   = ma.filter(a => a.status === 'absent').length
-    const marked   = ma.length
-    const attendRate = totalDays > 0 ? Math.round(((present + late) / totalDays) * 100) : 0
-    return { m, present, late, onLeave, absent, marked, attendRate, totalDays }
-  })
-
-  if (!rows.length) { el.innerHTML = '<div class="empty">No members found.</div>'; return }
-
-  el.innerHTML = rows.map(({ m, present, late, onLeave, absent, attendRate }) => {
-    const barColor = attendRate >= 80 ? 'var(--green)' : attendRate >= 60 ? 'var(--amber)' : 'var(--red)'
-    return `<div class="perf-row">
-      <div class="perf-avatar">${initials(m.name)}</div>
+  const rows = (members||[]).map(m => {
+    const ma = (att||[]).filter(a=>a.member_id===m.id)
+    const p  = ma.filter(a=>a.status==='present').length
+    const l  = ma.filter(a=>a.status==='late').length
+    const o  = ma.filter(a=>a.status==='on_leave').length
+    const ab = ma.filter(a=>a.status==='absent').length
+    const rate = Math.round(((p+l)/totalDays)*100)
+    const barCol = rate>=80?'var(--green)':rate>=60?'var(--amber)':'var(--red)'
+    return `<div class="perf-member-row">
+      <div class="perf-av">${initials(m.name)}</div>
       <div style="flex:1;min-width:0;">
         <div class="perf-name">${m.name}</div>
-        <div class="perf-bar-wrap" style="width:100%;margin-top:5px;">
-          <div class="perf-bar" style="width:${attendRate}%;background:${barColor};"></div>
+        <div class="rate-bar-wrap" style="width:min(200px,100%);margin-top:5px;">
+          <div class="rate-bar" style="width:${rate}%;background:${barCol};"></div>
         </div>
-        <div style="font-size:11px;color:var(--text3);margin-top:3px;">${attendRate}% attendance rate · ${totalDays} working days in range</div>
+        <div class="perf-meta">${rate}% attendance · ${totalDays} days</div>
       </div>
       <div class="perf-stats">
-        <div class="perf-stat"><div class="perf-stat-val" style="color:var(--green)">${present}</div><div class="perf-stat-lbl">Present</div></div>
-        <div class="perf-stat"><div class="perf-stat-val" style="color:var(--amber)">${late}</div><div class="perf-stat-lbl">Late</div></div>
-        <div class="perf-stat"><div class="perf-stat-val" style="color:var(--blue)">${onLeave}</div><div class="perf-stat-lbl">Leave</div></div>
-        <div class="perf-stat"><div class="perf-stat-val" style="color:var(--red)">${absent}</div><div class="perf-stat-lbl">Absent</div></div>
+        <div class="ps"><div class="ps-val" style="color:var(--green)">${p}</div><div class="ps-lbl">Present</div></div>
+        <div class="ps"><div class="ps-val" style="color:var(--amber)">${l}</div><div class="ps-lbl">Late</div></div>
+        <div class="ps"><div class="ps-val" style="color:var(--blue)">${o}</div><div class="ps-lbl">Leave</div></div>
+        <div class="ps"><div class="ps-val" style="color:var(--red)">${ab}</div><div class="ps-lbl">Absent</div></div>
       </div>
     </div>`
-  }).join('')
+  })
+  el.innerHTML = rows.length ? rows.join('') : '<div class="empty">No members found.</div>'
 }
 
-// ─── MEMBERS VIEW ─────────────────────────────────────────────
-async function renderMembersView() {
+// ─── MEMBERS ──────────────────────────────────────────────────
+async function loadMembers() {
   const el = document.getElementById('view-members')
-  el.innerHTML = `
-    <div class="page-header"><div><div class="page-title">Members</div><div class="page-sub">Manage team member accounts and devices</div></div><button class="btn btn-primary btn-sm" onclick="openAddMember()">+ Add member</button></div>
-    <div class="card"><div id="membersTableWrap"><div class="loading"><div class="spinner"></div> Loading…</div></div></div>
-  `
-  loadMembersTable()
+  el.innerHTML = `<div class="page-header"><div><div class="page-title">Members</div><div class="page-sub">Manage accounts, device locks and roles</div></div><button class="btn btn-primary btn-sm" onclick="openAddMember()">+ Add member</button></div><div class="card"><div id="memTbl"><div class="loading"><div class="spinner"></div></div></div></div>`
+  fillMembersTable()
 }
 
-async function loadMembersTable() {
-  const { data } = await supabase.from('members').select('*').order('created_at')
-  const members  = data || []
-  const el = document.getElementById('membersTableWrap')
-  el.innerHTML = members.length
-    ? `<div class="table-wrap"><table>
-        <thead><tr><th>Name</th><th>Username</th><th>Role</th><th>Device</th><th>Status</th><th></th></tr></thead>
-        <tbody>${members.map(m => `<tr>
-          <td><div style="display:flex;align-items:center;gap:9px;"><div style="width:28px;height:28px;border-radius:50%;background:var(--purple-bg);color:#a090f8;display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:700;border:1px solid var(--purple-border);flex-shrink:0;">${initials(m.name)}</div>${m.name}</div></td>
+async function fillMembersTable() {
+  const { data: all } = await supabase.from('members').select('*').order('created_at')
+  const el = document.getElementById('memTbl'); if (!el) return
+  el.innerHTML = (all||[]).length ? `
+    <div class="table-wrap"><table>
+      <thead><tr><th>Name</th><th>Username</th><th>Role</th><th>Device</th><th>Status</th><th></th></tr></thead>
+      <tbody>${(all||[]).map(m=>{
+        const isSelf        = m.id === currentUser?.id
+        const isTheSuperadmin = m.role === 'superadmin'
+        const canEdit       = isSuperAdmin() || (!isTheSuperadmin && m.role !== 'admin')
+        const canDelete     = isSuperAdmin() && !isSelf
+        return `<tr>
+          <td><div style="display:flex;align-items:center;gap:9px;"><div class="avatar-sm">${initials(m.name)}</div>${m.name}${isSelf?' <span style="font-size:10px;color:var(--text3);">(you)</span>':''}</div></td>
           <td style="font-family:var(--mono);font-size:12px;">@${m.username}</td>
-          <td><span class="badge badge-${m.role}">${m.role}</span></td>
-          <td>${m.device_fingerprint ? `<span class="badge badge-active">✓ Registered</span>` : '<span class="badge badge-inactive">Not yet</span>'}</td>
-          <td><span class="badge badge-${m.active ? 'active' : 'inactive'}">${m.active ? 'Active' : 'Inactive'}</span></td>
+          <td><span class="badge b-${m.role}">${m.role}</span></td>
+          <td>${m.device_fingerprint?'<span class="badge b-active">✓ Registered</span>':'<span class="badge b-inactive">Not set</span>'}</td>
+          <td><span class="badge b-${m.active?'active':'inactive'}">${m.active?'Active':'Inactive'}</span></td>
           <td>
-            <div class="action-menu-wrap">
-              <button class="btn-action" onclick="toggleMenu(event,'mmenu-${m.id}')">•••</button>
-              <div class="action-menu" id="mmenu-${m.id}">
-                <div class="action-item" onclick="resetDevice('${m.id}','${m.name.replace(/'/g,"\\'")}')">🔄 Reset device lock</div>
-                <div class="action-item" onclick="resetPassword('${m.id}','${m.username}')">🔑 Reset password</div>
-                <div class="action-item" onclick="toggleActive('${m.id}',${m.active})">
-                  ${m.active ? '⏸ Deactivate' : '▶ Activate'}
-                </div>
-                ${m.role !== 'admin' ? `<div class="action-item action-item-danger" onclick="deleteMember('${m.id}','${m.name.replace(/'/g,"\\'")}')">🗑 Delete</div>` : ''}
+            ${canEdit||canDelete ? `<div class="action-menu-wrap">
+              <button class="btn-action" onclick="toggleMenu(event,'mm-${m.id}')">•••</button>
+              <div class="action-menu" id="mm-${m.id}">
+                ${canEdit?`<div class="action-item" onclick="resetDevice('${m.id}','${m.name.replace(/'/g,"\\'")}')">🔄 Reset device lock</div>`:''}
+                ${canEdit?`<div class="action-item" onclick="resetPwd('${m.id}','${m.username}')">🔑 Reset password</div>`:''}
+                ${canEdit&&!isSelf?`<div class="action-item" onclick="toggleActive('${m.id}',${m.active})">${m.active?'⏸ Deactivate':'▶ Activate'}</div>`:''}
+                ${canDelete&&!isTheSuperadmin?`<div class="action-item action-item-danger" onclick="deleteMember('${m.id}','${m.name.replace(/'/g,"\\'")}')">🗑 Delete</div>`:''}
               </div>
-            </div>
+            </div>` : '<span style="font-size:12px;color:var(--text3);">—</span>'}
           </td>
-        </tr>`).join('')}</tbody>
-      </table></div>`
-    : '<div class="empty">No members yet.</div>'
+        </tr>`
+      }).join('')}</tbody>
+    </table></div>` : '<div class="empty">No members yet.</div>'
 }
 
-// ─── MEMBER ACTIONS ───────────────────────────────────────────
-window.openAddMember  = function() { document.getElementById('addMemberModal').style.display = 'flex' }
-window.closeAddMember = function() { document.getElementById('addMemberModal').style.display = 'none' }
-window.saveAddMember  = async function() {
-  const name     = document.getElementById('am-name').value.trim()
-  const username = document.getElementById('am-username').value.trim().toLowerCase()
-  const pass     = document.getElementById('am-pass').value
-  const role     = document.getElementById('am-role').value
-  if (!name || !username || !pass) { toast('All fields required', 'error'); return }
-  if (pass.length < 6) { toast('Password must be at least 6 characters', 'error'); return }
+window.openAddMember = () => { document.getElementById('addMemberModal').style.display='flex' }
+window.saveNewMember = async function() {
+  const name = document.getElementById('am-name').value.trim()
+  const user = document.getElementById('am-user').value.trim().toLowerCase()
+  const pass = document.getElementById('am-pass').value
+  const role = document.getElementById('am-role').value
+  if (!name||!user||!pass) { toast('All fields required','error'); return }
+  if (pass.length<6) { toast('Password must be 6+ characters','error'); return }
   const pwHash = await hashPassword(pass)
-  const { error } = await supabase.from('members').insert({ name, username, password_hash: pwHash, role })
-  if (error?.code === '23505') { toast('Username already taken', 'error'); return }
-  if (error) { toast('Error adding member', 'error'); return }
-  toast(`${name} added ✓`, 'success')
-  closeAddMember()
-  ;['am-name','am-pass'].forEach(id => document.getElementById(id).value = '')
-  document.getElementById('am-username').value = ''
-  loadMembersTable()
+  const { error } = await supabase.from('members').insert({ name, username:user, password_hash:pwHash, role })
+  if (error?.code==='23505') { toast('Username taken','error'); return }
+  if (error) { toast('Error adding member','error'); return }
+  toast(`${name} added ✓`,'success')
+  closeM('addMemberModal')
+  ;['am-name','am-user','am-pass'].forEach(id=>document.getElementById(id).value='')
+  fillMembersTable()
 }
 
 window.resetDevice = async function(id, name) {
-  if (!confirm(`Reset device lock for "${name}"?\n\nThey will be able to log in from any device and a new device lock will be set on their next login.`)) return
-  await supabase.from('members').update({ device_fingerprint: null, device_approved: false }).eq('id', id)
-  await supabase.from('sessions').delete().eq('member_id', id)
-  toast(`Device lock reset for ${name} ✓`, 'success'); loadMembersTable()
+  if (!confirm(`Reset device lock for "${name}"?\n\nThey can log in from any device next time and their device will be re-registered.`)) return
+  await supabase.from('members').update({ device_fingerprint:null, device_approved:false }).eq('id',id)
+  await supabase.from('sessions').delete().eq('member_id',id)
+  toast('Device lock reset ✓','success'); fillMembersTable()
 }
 
-window.resetPassword = async function(id, username) {
-  const newPass = prompt(`Set new password for @${username}:`)
-  if (!newPass?.trim()) return
-  if (newPass.length < 6) { toast('Password must be at least 6 characters', 'error'); return }
-  const pwHash = await hashPassword(newPass)
-  await supabase.from('members').update({ password_hash: pwHash }).eq('id', id)
-  await supabase.from('sessions').delete().eq('member_id', id)
-  toast('Password reset ✓', 'success')
+window.resetPwd = async function(id, username) {
+  const np = prompt(`New password for @${username}:`)
+  if (!np?.trim()) return
+  if (np.length<6) { toast('Min 6 characters','error'); return }
+  const ph = await hashPassword(np)
+  await supabase.from('members').update({ password_hash:ph }).eq('id',id)
+  await supabase.from('sessions').delete().eq('member_id',id)
+  toast('Password reset ✓','success')
 }
 
-window.toggleActive = async function(id, current) {
-  await supabase.from('members').update({ active: !current }).eq('id', id)
-  if (current) await supabase.from('sessions').delete().eq('member_id', id)
-  toast(current ? 'Member deactivated' : 'Member activated', 'success'); loadMembersTable()
+window.toggleActive = async function(id, cur) {
+  await supabase.from('members').update({ active:!cur }).eq('id',id)
+  if (cur) await supabase.from('sessions').delete().eq('member_id',id)
+  toast(cur?'Deactivated':'Activated','success'); fillMembersTable()
 }
 
 window.deleteMember = async function(id, name) {
-  if (!confirm(`Permanently delete "${name}"?\n\nThis will also delete all their attendance records.\nThis cannot be undone.`)) return
-  await supabase.from('attendance').delete().eq('member_id', id)
-  await supabase.from('sessions').delete().eq('member_id', id)
-  await supabase.from('members').delete().eq('id', id)
-  toast(`${name} deleted`, 'success'); loadMembersTable()
+  if (!confirm(`Permanently delete "${name}"?\n\nAll attendance records will also be deleted.\nThis cannot be undone.`)) return
+  await supabase.from('attendance').delete().eq('member_id',id)
+  await supabase.from('sessions').delete().eq('member_id',id)
+  await supabase.from('members').delete().eq('id',id)
+  toast(`${name} deleted`,'success'); fillMembersTable()
 }
 
-// ─── ATTENDANCE EDIT ──────────────────────────────────────────
+// ─── SETTINGS ────────────────────────────────────────────────
+async function loadSettings() {
+  const el = document.getElementById('view-settings')
+  const { data } = await supabase.from('settings').select('value').eq('key','office_start_time').single()
+  const current = (data?.value||'"09:00"').replace(/"/g,'')
+
+  el.innerHTML = `
+    <div class="page-header"><div><div class="page-title">Settings</div><div class="page-sub">System configuration</div></div></div>
+    <div class="card">
+      <div class="card-hdr"><span class="card-title">Office hours</span></div>
+      <div class="card-body">
+        <p style="font-size:13px;color:var(--text2);margin-bottom:16px;">
+          Team members who check in after this time will be automatically marked as <strong style="color:var(--amber);">Late</strong>.
+        </p>
+        <div style="display:flex;gap:12px;align-items:flex-end;flex-wrap:wrap;">
+          <div class="fg" style="margin-bottom:0;">
+            <label class="field-label">Office start time</label>
+            <input type="time" id="officeTime" value="${current}" style="max-width:140px;" />
+          </div>
+          <button class="btn btn-primary btn-sm" onclick="saveOfficeTime()">Save</button>
+        </div>
+      </div>
+    </div>
+    ${isSuperAdmin() ? `
+    <div class="card">
+      <div class="card-hdr"><span class="card-title">Admin account</span></div>
+      <div class="card-body">
+        <p style="font-size:13px;color:var(--text2);margin-bottom:16px;">Change the super admin password. You will be signed out on all devices after saving.</p>
+        <div style="display:flex;gap:12px;align-items:flex-end;flex-wrap:wrap;">
+          <div class="fg" style="margin-bottom:0;">
+            <label class="field-label">New password</label>
+            <input type="password" id="newAdminPass" placeholder="min 6 characters" style="max-width:220px;" />
+          </div>
+          <button class="btn btn-amber btn-sm" onclick="changeOwnPassword()">Change password</button>
+        </div>
+      </div>
+    </div>` : ''}
+  `
+}
+
+window.saveOfficeTime = async function() {
+  const val = document.getElementById('officeTime')?.value
+  if (!val) return
+  await supabase.from('settings').upsert({ key:'office_start_time', value: JSON.stringify(val), updated_at: nowStr() })
+  officeStart = val
+  toast(`Office start time set to ${val} ✓`,'success')
+}
+
+window.changeOwnPassword = async function() {
+  const np = document.getElementById('newAdminPass')?.value
+  if (!np?.trim()||np.length<6) { toast('Min 6 characters','error'); return }
+  const ph = await hashPassword(np)
+  await supabase.from('members').update({ password_hash:ph }).eq('id',currentUser.id)
+  await supabase.from('sessions').delete().eq('member_id',currentUser.id)
+  toast('Password changed. Signing out…','success')
+  setTimeout(doLogout, 1500)
+}
+
+// ─── ATTENDANCE EDIT / MANUAL ─────────────────────────────────
 window.openEditAtt = async function(id) {
-  document.querySelectorAll('.action-menu.open').forEach(m => m.classList.remove('open'))
-  const { data } = await supabase.from('attendance').select('*').eq('id', id).single()
-  if (!data) return
-  document.getElementById('ea-id').value     = data.id
-  document.getElementById('ea-member').value = data.member_name
-  document.getElementById('ea-date').value   = data.date
-  document.getElementById('ea-status').value = data.status
-  document.getElementById('ea-checkin').value = data.check_in_time ? new Date(data.check_in_time).toTimeString().slice(0,5) : ''
-  document.getElementById('ea-note').value   = data.note || ''
-  document.getElementById('editAttModal').style.display = 'flex'
+  document.querySelectorAll('.action-menu.open').forEach(m=>m.classList.remove('open'))
+  const { data: r } = await supabase.from('attendance').select('*').eq('id',id).single()
+  if (!r) return
+  document.getElementById('ea-id').value   = r.id
+  document.getElementById('ea-mem').value  = r.member_name
+  document.getElementById('ea-date').value = r.date
+  document.getElementById('ea-status').value = r.status
+  document.getElementById('ea-cin').value  = r.check_in_time  ? new Date(r.check_in_time).toTimeString().slice(0,5)  : ''
+  document.getElementById('ea-cout').value = r.check_out_time ? new Date(r.check_out_time).toTimeString().slice(0,5) : ''
+  document.getElementById('ea-note').value = r.note||''
+  document.getElementById('editAttModal').style.display='flex'
 }
-window.closeEditAtt = function() { document.getElementById('editAttModal').style.display = 'none' }
-window.saveEditAtt  = async function() {
-  const id     = document.getElementById('ea-id').value
-  const date   = document.getElementById('ea-date').value
-  const timeVal = document.getElementById('ea-checkin').value
-  const updates = {
-    date,
-    status:        document.getElementById('ea-status').value,
-    check_in_time: timeVal ? new Date(`${date}T${timeVal}`).toISOString() : null,
-    note:          document.getElementById('ea-note').value.trim() || null,
-    marked_by:     'admin',
+window.saveEditAtt = async function() {
+  const id   = document.getElementById('ea-id').value
+  const date = document.getElementById('ea-date').value
+  const cin  = document.getElementById('ea-cin').value
+  const cout = document.getElementById('ea-cout').value
+  const upd  = {
+    date, status: document.getElementById('ea-status').value,
+    check_in_time:  cin  ? new Date(`${date}T${cin}`).toISOString()  : null,
+    check_out_time: cout ? new Date(`${date}T${cout}`).toISOString() : null,
+    note: document.getElementById('ea-note').value.trim()||null,
+    marked_by:'admin'
   }
-  await supabase.from('attendance').update(updates).eq('id', id)
-  closeEditAtt(); toast('Record updated ✓', 'success')
-  loadAttendanceTable(
-    document.getElementById('att-from')?.value || todayStr(),
-    document.getElementById('att-to')?.value   || todayStr(),
-    document.getElementById('att-member')?.value || ''
-  )
+  await supabase.from('attendance').update(upd).eq('id',id)
+  closeM('editAttModal'); toast('Record updated ✓','success')
+  fillAttTable(document.getElementById('af-from')?.value||todayStr(), document.getElementById('af-to')?.value||todayStr(), document.getElementById('af-mem')?.value||'')
 }
 
-window.deleteAtt = async function(id) {
-  document.querySelectorAll('.action-menu.open').forEach(m => m.classList.remove('open'))
+window.delAtt = async function(id) {
+  document.querySelectorAll('.action-menu.open').forEach(m=>m.classList.remove('open'))
   if (!confirm('Delete this attendance record?')) return
-  await supabase.from('attendance').delete().eq('id', id)
-  toast('Deleted', 'success')
-  loadAttendanceTable(
-    document.getElementById('att-from')?.value || todayStr(),
-    document.getElementById('att-to')?.value   || todayStr(),
-    document.getElementById('att-member')?.value || ''
-  )
+  await supabase.from('attendance').delete().eq('id',id)
+  toast('Deleted','success')
+  fillAttTable(document.getElementById('af-from')?.value||todayStr(), document.getElementById('af-to')?.value||todayStr(), document.getElementById('af-mem')?.value||'')
 }
 
-// ─── MANUAL ATTENDANCE ────────────────────────────────────────
 window.openManualAtt = async function() {
-  const { data: members } = await supabase.from('members').select('*').eq('active', true).neq('role', 'admin')
-  const sel = document.getElementById('ma-member')
-  sel.innerHTML = (members||[]).map(m => `<option value="${m.id}" data-name="${m.name}">${m.name}</option>`).join('')
-  document.getElementById('ma-date').value    = todayStr()
-  document.getElementById('ma-checkin').value = ''
-  document.getElementById('ma-note').value    = ''
+  const { data: members } = await supabase.from('members').select('*').eq('active',true).neq('role','superadmin').neq('role','admin')
+  const sel = document.getElementById('ma-mem')
+  sel.innerHTML = (members||[]).map(m=>`<option value="${m.id}" data-name="${m.name}">${m.name}</option>`).join('')
+  document.getElementById('ma-date').value = todayStr()
+  document.getElementById('ma-cin').value  = ''
+  document.getElementById('ma-note').value = ''
   document.getElementById('manualAttModal').style.display = 'flex'
 }
-window.closeManualAtt = function() { document.getElementById('manualAttModal').style.display = 'none' }
-window.saveManualAtt  = async function() {
-  const selEl   = document.getElementById('ma-member')
-  const memberId = selEl.value
-  const memberName = selEl.options[selEl.selectedIndex]?.dataset.name || ''
-  const date    = document.getElementById('ma-date').value
-  const status  = document.getElementById('ma-status').value
-  const timeVal = document.getElementById('ma-checkin').value
-  const note    = document.getElementById('ma-note').value.trim() || null
-  if (!memberId || !date) { toast('Member and date required', 'error'); return }
-
+window.saveManualAtt = async function() {
+  const selEl = document.getElementById('ma-mem')
+  const memId = selEl.value
+  const memName = selEl.options[selEl.selectedIndex]?.dataset.name||''
+  const date  = document.getElementById('ma-date').value
+  const cin   = document.getElementById('ma-cin').value
+  const status = document.getElementById('ma-status').value
+  const note  = document.getElementById('ma-note').value.trim()||null
+  if (!memId||!date) { toast('Member and date required','error'); return }
   const row = {
-    member_id:    memberId,
-    member_name:  memberName,
-    date,
-    check_in_time: timeVal ? new Date(`${date}T${timeVal}`).toISOString() : null,
-    status,
-    note,
-    marked_by: 'admin',
+    member_id:memId, member_name:memName, date,
+    check_in_time: cin ? new Date(`${date}T${cin}`).toISOString() : null,
+    status, note, marked_by:'admin'
   }
-  const { error } = await supabase.from('attendance').upsert(row, { onConflict: 'member_id,date' })
-  if (error) { toast('Error saving attendance', 'error'); return }
-  closeManualAtt(); toast('Attendance marked ✓', 'success')
-  if (adminView === 'dashboard')  renderDashboard()
-  if (adminView === 'attendance') renderAttendanceView()
+  const { error } = await supabase.from('attendance').upsert(row, { onConflict:'member_id,date' })
+  if (error) { toast('Error saving','error'); return }
+  closeM('manualAttModal'); toast('Attendance marked ✓','success')
+  if (adminView==='dashboard')  loadDashboard()
+  if (adminView==='attendance') loadAttendance()
 }
 
 // ─── CSV EXPORTS ──────────────────────────────────────────────
-window.exportAttendanceCSV = async function() {
-  const from   = document.getElementById('att-from')?.value || todayStr()
-  const to     = document.getElementById('att-to')?.value   || todayStr()
-  const member = document.getElementById('att-member')?.value || ''
-  let q = supabase.from('attendance').select('*').gte('date', from).lte('date', to).order('date', { ascending: false })
-  if (member) q = q.eq('member_id', member)
+window.exportAttCSV = async function() {
+  const from = document.getElementById('af-from')?.value||todayStr()
+  const to   = document.getElementById('af-to')?.value||todayStr()
+  const mem  = document.getElementById('af-mem')?.value||''
+  let q = supabase.from('attendance').select('*').gte('date',from).lte('date',to).order('date',{ascending:false})
+  if (mem) q = q.eq('member_id',mem)
   const { data } = await q
-  if (!data?.length) { toast('No data to export', 'error'); return }
-  const headers = ['Date', 'Member', 'Status', 'Check-in Time', 'Note', 'Marked By']
-  const rows = data.map(r => [
-    r.date, r.member_name, r.status,
-    r.check_in_time ? fmt12(r.check_in_time) : '',
-    r.note || '', r.marked_by || ''
-  ])
-  downloadCSV(`attendance_${from}_to_${to}.csv`, headers, rows)
-  toast('CSV downloaded ✓', 'success')
+  if (!data?.length) { toast('No data to export','error'); return }
+  const headers = ['Date','Member','Status','Check-in','Check-out','Note','Marked By']
+  const rows    = data.map(r=>[r.date,r.member_name,r.status,fmt12(r.check_in_time),fmt12(r.check_out_time),r.note||'',r.marked_by||''])
+  dlCSV(`haazri_attendance_${from}_${to}.csv`, headers, rows)
+  toast('CSV downloaded ✓','success')
 }
 
-window.exportPerformanceCSV = async function() {
-  const from = document.getElementById('perf-from')?.value || todayStr()
-  const to   = document.getElementById('perf-to')?.value   || todayStr()
-  const [membRes, attRes] = await Promise.all([
-    supabase.from('members').select('*').eq('active', true).neq('role', 'admin'),
-    supabase.from('attendance').select('*').gte('date', from).lte('date', to)
+window.exportPerfCSV = async function() {
+  const from = document.getElementById('pf-from')?.value||todayStr()
+  const to   = document.getElementById('pf-to')?.value||todayStr()
+  const [{ data: members },{ data: att }] = await Promise.all([
+    supabase.from('members').select('*').eq('active',true).neq('role','superadmin').neq('role','admin'),
+    supabase.from('attendance').select('*').gte('date',from).lte('date',to)
   ])
-  const members = membRes.data || []; const att = attRes.data || []
-  const d1 = new Date(from), d2 = new Date(to)
-  const totalDays = Math.max(1, Math.round((d2 - d1) / 86400000) + 1)
-  const headers = ['Member', 'Present', 'Late', 'On Leave', 'Absent', 'Total Days', 'Attendance Rate %']
-  const rows = members.map(m => {
-    const ma = att.filter(a => a.member_id === m.id)
-    const p = ma.filter(a => a.status === 'present').length
-    const l = ma.filter(a => a.status === 'late').length
-    const o = ma.filter(a => a.status === 'on_leave').length
-    const ab = ma.filter(a => a.status === 'absent').length
-    const rate = Math.round(((p + l) / totalDays) * 100)
-    return [m.name, p, l, o, ab, totalDays, rate + '%']
+  const d1=new Date(from),d2=new Date(to)
+  const total=Math.max(1,Math.round((d2-d1)/86400000)+1)
+  const headers=['Member','Present','Late','On Leave','Absent','Total Days','Attendance %']
+  const rows=(members||[]).map(m=>{
+    const ma=(att||[]).filter(a=>a.member_id===m.id)
+    const p=ma.filter(a=>a.status==='present').length
+    const l=ma.filter(a=>a.status==='late').length
+    const o=ma.filter(a=>a.status==='on_leave').length
+    const ab=ma.filter(a=>a.status==='absent').length
+    return [m.name,p,l,o,ab,total,Math.round(((p+l)/total)*100)+'%']
   })
-  downloadCSV(`performance_${from}_to_${to}.csv`, headers, rows)
-  toast('CSV downloaded ✓', 'success')
+  dlCSV(`haazri_performance_${from}_${to}.csv`, headers, rows)
+  toast('CSV downloaded ✓','success')
 }
 
-function downloadCSV(filename, headers, rows) {
-  const escape = v => `"${String(v).replace(/"/g, '""')}"`
-  const lines  = [headers.map(escape).join(','), ...rows.map(r => r.map(escape).join(','))]
-  const blob   = new Blob([lines.join('\n')], { type: 'text/csv;charset=utf-8;' })
-  const url    = URL.createObjectURL(blob)
-  const a      = document.createElement('a'); a.href = url; a.download = filename
+function dlCSV(fname, headers, rows) {
+  const esc  = v => `"${String(v).replace(/"/g,'""')}"`
+  const lines = [headers.map(esc).join(','), ...rows.map(r=>r.map(esc).join(','))]
+  const blob  = new Blob([lines.join('\n')], { type:'text/csv;charset=utf-8;' })
+  const url   = URL.createObjectURL(blob)
+  const a     = document.createElement('a'); a.href=url; a.download=fname
   document.body.appendChild(a); a.click(); document.body.removeChild(a); URL.revokeObjectURL(url)
 }
 
