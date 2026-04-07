@@ -6,7 +6,9 @@ import { getDeviceFingerprint, hashPassword } from './fingerprint.js'
 let currentUser  = null
 let currentToken = null
 let deviceFP     = null
-let officeStart  = '09:00'   // HH:MM — loaded from settings
+let officeStart      = '09:00'   // HH:MM
+let officeEnd        = '18:00'   // HH:MM
+let absentAfterHours = 2          // hours after start before auto-absent
 let adminView    = 'dashboard'
 
 // ─── Boot ─────────────────────────────────────────────────────
@@ -44,8 +46,14 @@ const isSuperAdmin = () => currentUser?.role === 'superadmin'
 const rand = (n=32) => Array.from(crypto.getRandomValues(new Uint8Array(n))).map(b=>b.toString(16).padStart(2,'0')).join('')
 
 async function loadOfficeTime() {
-  const { data } = await supabase.from('settings').select('value').eq('key','office_start_time').single()
-  if (data?.value) officeStart = data.value.replace(/"/g,'')
+  const { data: rows } = await supabase.from('settings').select('*').in('key',['office_start_time','office_end_time','absent_after_hours'])
+  if (!rows) return
+  for (const r of rows) {
+    const v = typeof r.value === 'string' ? r.value.replace(/"/g,'') : r.value
+    if (r.key === 'office_start_time')  officeStart      = v
+    if (r.key === 'office_end_time')    officeEnd        = v
+    if (r.key === 'absent_after_hours') absentAfterHours = Number(v) || 2
+  }
 }
 
 function isLate(checkinTime) {
@@ -54,9 +62,14 @@ function isLate(checkinTime) {
   const d = new Date(checkinTime)
   return d.getHours() > oh || (d.getHours() === oh && d.getMinutes() > om)
 }
+// 'on_time' status: checked in at or before officeStart
+function checkinStatus(checkinTime) {
+  if (!checkinTime) return 'absent'
+  return isLate(checkinTime) ? 'late' : 'on_time'
+}
 
 function statusBadge(s) {
-  const map = { present:'✅ Present', late:'🕐 Late', absent:'❌ Absent', on_leave:'🏖 On Leave' }
+  const map = { on_time:'🟢 On time', present:'✅ Present', late:'🕐 Late', absent:'❌ Absent', on_leave:'🏖 On Leave' }
   return `<span class="badge b-${s}">${map[s]||s}</span>`
 }
 
@@ -191,10 +204,11 @@ function renderAttendanceContent(record) {
 
   if (record) {
     const statusConf = {
-      present: { cls:'sr-present', icon:'✅', label:'Present',  color:'var(--green)' },
-      late:    { cls:'sr-late',    icon:'🕐', label:'Late',     color:'var(--amber)' },
-      absent:  { cls:'sr-absent',  icon:'❌', label:'Absent',   color:'var(--red)'   },
-      on_leave:{ cls:'sr-leave',   icon:'🏖', label:'On Leave', color:'var(--blue)'  },
+      on_time: { cls:'sr-present', icon:'🟢', label:'Present · On time', color:'var(--green)' },
+      present: { cls:'sr-present', icon:'✅', label:'Present',            color:'var(--green)' },
+      late:    { cls:'sr-late',    icon:'🕐', label:'Present · Late',     color:'var(--amber)' },
+      absent:  { cls:'sr-absent',  icon:'❌', label:'Absent',             color:'var(--red)'   },
+      on_leave:{ cls:'sr-leave',   icon:'🏖', label:'On Leave',           color:'var(--blue)'  },
     }
     const sc = statusConf[record.status] || statusConf.present
     const checkedOut = !!record.check_out_time
@@ -207,7 +221,7 @@ function renderAttendanceContent(record) {
           ${checkedOut ? ` · Out at ${fmt12(record.check_out_time)}` : ''}
         </div>
       </div>
-      ${!checkedOut && (record.status === 'present' || record.status === 'late') ? `
+      ${!checkedOut && (record.status === 'present' || record.status === 'late' || record.status === 'on_time') ? `
         <button class="btn btn-amber btn-full" onclick="doCheckOut('${record.id}')">
           🚪 Check out
         </button>
@@ -239,7 +253,8 @@ window.doCheckIn = async function() {
   const btn = document.getElementById('ciBtn')
   if (btn) { btn.disabled = true; btn.textContent = 'Saving…' }
   const checkInTime = new Date().toISOString()
-  const finalStatus = isLate(checkInTime) ? 'late' : 'present'
+  // on_time = checked in on time, late = checked in late; both are PRESENT
+  const finalStatus = checkinStatus(checkInTime)
   const note = null
 
   const row = {
@@ -352,8 +367,9 @@ function renderAdmin() {
         <div class="fg"><label class="field-label">Date</label><input type="date" id="ea-date" /></div>
         <div class="fg"><label class="field-label">Status</label>
           <select id="ea-status">
+            <option value="on_time">🟢 On time (present)</option>
             <option value="present">✅ Present</option>
-            <option value="late">🕐 Late</option>
+            <option value="late">🕐 Late (present)</option>
             <option value="on_leave">🏖 On Leave</option>
             <option value="absent">❌ Absent</option>
           </select>
@@ -378,8 +394,9 @@ function renderAdmin() {
         <div class="fg"><label class="field-label">Date</label><input type="date" id="ma-date" /></div>
         <div class="fg"><label class="field-label">Status</label>
           <select id="ma-status">
+            <option value="on_time">🟢 On time (present)</option>
             <option value="present">✅ Present</option>
-            <option value="late">🕐 Late</option>
+            <option value="late">🕐 Late (present)</option>
             <option value="on_leave">🏖 On Leave</option>
             <option value="absent">❌ Absent</option>
           </select>
@@ -420,17 +437,37 @@ window.toggleMenu = function(e, id) {
 document.addEventListener('click', () => document.querySelectorAll('.action-menu.open').forEach(m => m.classList.remove('open')))
 
 // ─── DASHBOARD ────────────────────────────────────────────────
+// Silent auto-absent — runs on dashboard load without toast
+async function _silentAutoAbsent() {
+  const today    = todayStr()
+  const now      = new Date()
+  const [oh, om] = officeStart.split(':').map(Number)
+  const cutoff   = new Date()
+  cutoff.setHours(oh + absentAfterHours, om, 0, 0)
+  if (now < cutoff) return  // cutoff not reached
+  const { data: members }  = await supabase.from('members').select('id,name').eq('active',true).not('role','in','("superadmin","admin")')
+  const { data: existing } = await supabase.from('attendance').select('member_id').eq('date', today)
+  const checkedInIds = new Set((existing||[]).map(a=>a.member_id))
+  const toMark = (members||[]).filter(m => !checkedInIds.has(m.id))
+  if (!toMark.length) return
+  const rows = toMark.map(m => ({ member_id:m.id, member_name:m.name, date:today, status:'absent', marked_by:'auto' }))
+  await supabase.from('attendance').upsert(rows, { onConflict:'member_id,date' })
+}
+
 async function loadDashboard() {
   const el = document.getElementById('view-dashboard')
   const today = todayStr()
+  // Auto-mark absent silently when dashboard loads
+  await _silentAutoAbsent()
   el.innerHTML = `<div class="page-header"><div><div class="page-title">Dashboard</div><div class="page-sub">${new Date().toLocaleDateString('en-US',{weekday:'long',day:'numeric',month:'long',year:'numeric'})}</div></div><button class="btn btn-ghost btn-sm" onclick="openManualAtt()">+ Mark manually</button></div><div class="loading"><div class="spinner"></div> Loading…</div>`
 
   const [{ data: members }, { data: att }] = await Promise.all([
     supabase.from('members').select('*').eq('active',true).neq('role','superadmin').neq('role','admin'),
     supabase.from('attendance').select('*').eq('date', today)
   ])
-  const present   = att?.filter(a=>a.status==='present').length  || 0
-  const late      = att?.filter(a=>a.status==='late').length     || 0
+  const presentAll = att?.filter(a=>['present','on_time','late'].includes(a.status)).length || 0
+  const late      = att?.filter(a=>a.status==='late').length || 0
+  const onTime    = att?.filter(a=>a.status==='on_time').length || 0
   const onLeave   = att?.filter(a=>a.status==='on_leave').length || 0
   const absent    = att?.filter(a=>a.status==='absent').length   || 0
   const notMarked = (members||[]).filter(m => !att?.find(a=>a.member_id===m.id)).length
@@ -441,7 +478,8 @@ async function loadDashboard() {
       <button class="btn btn-ghost btn-sm" onclick="openManualAtt()">+ Mark manually</button>
     </div>
     <div class="stat-grid">
-      <div class="stat-box"><div class="stat-box-accent" style="background:var(--green)"></div><div class="stat-label">Present</div><div class="stat-value" style="color:var(--green)">${present}</div></div>
+      <div class="stat-box"><div class="stat-box-accent" style="background:var(--green)"></div><div class="stat-label">Present</div><div class="stat-value" style="color:var(--green)">${presentAll}</div></div>
+      <div class="stat-box"><div class="stat-box-accent" style="background:var(--teal)"></div><div class="stat-label">On time</div><div class="stat-value" style="color:var(--teal)">${onTime}</div></div>
       <div class="stat-box"><div class="stat-box-accent" style="background:var(--amber)"></div><div class="stat-label">Late</div><div class="stat-value" style="color:var(--amber)">${late}</div></div>
       <div class="stat-box"><div class="stat-box-accent" style="background:var(--blue)"></div><div class="stat-label">On Leave</div><div class="stat-value" style="color:var(--blue)">${onLeave}</div></div>
       <div class="stat-box"><div class="stat-box-accent" style="background:var(--red)"></div><div class="stat-label">Absent</div><div class="stat-value" style="color:var(--red)">${absent}</div></div>
@@ -458,7 +496,7 @@ async function loadDashboard() {
             <td><div style="display:flex;align-items:center;gap:9px;"><div class="avatar-sm">${initials(m.name)}</div>${m.name}</div></td>
             <td>${a ? statusBadge(a.status) : '<span style="color:var(--text3);font-size:12px;">—</span>'}</td>
             <td style="font-family:var(--mono);font-size:12px;">${a ? fmt12(a.check_in_time) : '—'}</td>
-            <td style="font-family:var(--mono);font-size:12px;">${a ? fmt12(a.check_out_time) : '—'}</td>
+            <td style="font-family:var(--mono);font-size:12px;">${a?.check_out_time ? fmt12(a.check_out_time) : '—'}</td>
             <td style="font-size:12px;color:var(--text2);">${a?.note||'—'}</td>
             <td style="font-size:12px;color:var(--text3);">${a?.marked_by||'—'}</td>
           </tr>`
@@ -522,7 +560,7 @@ async function fillAttTable(from, to, memF) {
         <td>${r.member_name}</td>
         <td>${statusBadge(r.status)}</td>
         <td style="font-family:var(--mono);font-size:12px;">${fmt12(r.check_in_time)}</td>
-        <td style="font-family:var(--mono);font-size:12px;">${fmt12(r.check_out_time)}</td>
+        <td style="font-family:var(--mono);font-size:12px;">${r.check_out_time ? fmt12(r.check_out_time) : '—'}</td>
         <td style="font-size:12px;color:var(--text2);max-width:150px;">${r.note||'—'}</td>
         <td style="font-size:12px;color:var(--text3);">${r.marked_by||'—'}</td>
         <td>
@@ -577,7 +615,7 @@ async function fillPerfRows(from, to) {
 
   const rows = (members||[]).map(m => {
     const ma = (att||[]).filter(a=>a.member_id===m.id)
-    const p  = ma.filter(a=>a.status==='present').length
+    const p  = ma.filter(a=>a.status==='present'||a.status==='on_time').length
     const l  = ma.filter(a=>a.status==='late').length
     const o  = ma.filter(a=>a.status==='on_leave').length
     const ab = ma.filter(a=>a.status==='absent').length
@@ -695,31 +733,55 @@ window.deleteMember = async function(id, name) {
 // ─── SETTINGS ────────────────────────────────────────────────
 async function loadSettings() {
   const el = document.getElementById('view-settings')
-  const { data } = await supabase.from('settings').select('value').eq('key','office_start_time').single()
-  const current = (data?.value||'"09:00"').replace(/"/g,'')
+  const { data: rows } = await supabase.from('settings').select('*')
+    .in('key',['office_start_time','office_end_time','absent_after_hours'])
+  const smap = {}
+  for (const r of rows||[]) smap[r.key] = (typeof r.value==='string' ? r.value : JSON.stringify(r.value)).replace(/"/g,'')
+  const start  = smap['office_start_time']  || '09:00'
+  const end    = smap['office_end_time']    || '18:00'
+  const aahrs  = smap['absent_after_hours'] || '2'
 
   el.innerHTML = `
-    <div class="page-header"><div><div class="page-title">Settings</div><div class="page-sub">System configuration</div></div></div>
+    <div class="page-header"><div><div class="page-title">Settings</div><div class="page-sub">System configuration — changes apply immediately to all future check-ins</div></div></div>
     <div class="card">
       <div class="card-hdr"><span class="card-title">Office hours</span></div>
       <div class="card-body">
-        <p style="font-size:13px;color:var(--text2);margin-bottom:16px;">
-          Team members who check in after this time will be automatically marked as <strong style="color:var(--amber);">Late</strong>.
-        </p>
-        <div style="display:flex;gap:12px;align-items:flex-end;flex-wrap:wrap;">
+        <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:16px;margin-bottom:18px;">
           <div class="fg" style="margin-bottom:0;">
             <label class="field-label">Office start time</label>
-            <input type="time" id="officeTime" value="${current}" style="max-width:140px;" />
+            <input type="time" id="officeStartTime" value="${start}" />
+            <div style="font-size:11.5px;color:var(--text3);margin-top:4px;">Check-ins after this = Late</div>
           </div>
-          <button class="btn btn-primary btn-sm" onclick="saveOfficeTime()">Save</button>
+          <div class="fg" style="margin-bottom:0;">
+            <label class="field-label">Office end time</label>
+            <input type="time" id="officeEndTime" value="${end}" />
+            <div style="font-size:11.5px;color:var(--text3);margin-top:4px;">Expected check-out time</div>
+          </div>
+          <div class="fg" style="margin-bottom:0;">
+            <label class="field-label">Auto-absent after (hours)</label>
+            <input type="number" id="absentAfterHrs" value="${aahrs}" min="1" max="12" style="max-width:100px;" />
+            <div style="font-size:11.5px;color:var(--text3);margin-top:4px;">Hours after start, no check-in = Absent</div>
+          </div>
         </div>
+        <button class="btn btn-primary btn-sm" onclick="saveOfficeSettings()">Save office settings</button>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-hdr"><span class="card-title">Auto-absent rules</span></div>
+      <div class="card-body">
+        <p style="font-size:13px;color:var(--text2);margin-bottom:14px;line-height:1.6;">
+          When you open the dashboard, Haazri HQ automatically marks absent any member who has not checked in
+          within <strong style="color:var(--text)">${aahrs} hours</strong> of the office start time (<strong style="color:var(--text)">${start}</strong>).
+          This runs every time any admin loads the dashboard.
+        </p>
+        <button class="btn btn-ghost btn-sm" onclick="runAutoAbsent()">▶ Run auto-absent now</button>
       </div>
     </div>
     ${isSuperAdmin() ? `
     <div class="card">
       <div class="card-hdr"><span class="card-title">Admin account</span></div>
       <div class="card-body">
-        <p style="font-size:13px;color:var(--text2);margin-bottom:16px;">Change the super admin password. You will be signed out on all devices after saving.</p>
+        <p style="font-size:13px;color:var(--text2);margin-bottom:14px;">Change the superadmin password. All sessions will be signed out.</p>
         <div style="display:flex;gap:12px;align-items:flex-end;flex-wrap:wrap;">
           <div class="fg" style="margin-bottom:0;">
             <label class="field-label">New password</label>
@@ -732,12 +794,40 @@ async function loadSettings() {
   `
 }
 
-window.saveOfficeTime = async function() {
-  const val = document.getElementById('officeTime')?.value
-  if (!val) return
-  await supabase.from('settings').upsert({ key:'office_start_time', value: JSON.stringify(val), updated_at: nowStr() })
-  officeStart = val
-  toast(`Office start time set to ${val} ✓`,'success')
+window.saveOfficeSettings = async function() {
+  const start = document.getElementById('officeStartTime')?.value
+  const end   = document.getElementById('officeEndTime')?.value
+  const aah   = document.getElementById('absentAfterHrs')?.value
+  if (!start) { toast('Start time required','error'); return }
+  await Promise.all([
+    supabase.from('settings').upsert({ key:'office_start_time',  value: JSON.stringify(start), updated_at: nowStr() }),
+    supabase.from('settings').upsert({ key:'office_end_time',    value: JSON.stringify(end||'18:00'), updated_at: nowStr() }),
+    supabase.from('settings').upsert({ key:'absent_after_hours', value: JSON.stringify(String(aah||'2')), updated_at: nowStr() }),
+  ])
+  officeStart      = start
+  officeEnd        = end || '18:00'
+  absentAfterHours = Number(aah) || 2
+  toast('Office settings saved ✓','success')
+}
+
+// Auto-absent: mark members absent if past (officeStart + absentAfterHours) and no check-in today
+window.runAutoAbsent = async function() {
+  const today     = todayStr()
+  const now       = new Date()
+  const [oh, om]  = officeStart.split(':').map(Number)
+  const cutoff    = new Date()
+  cutoff.setHours(oh + absentAfterHours, om, 0, 0)
+  if (now < cutoff) { toast('Cutoff time not reached yet — no action taken'); return }
+
+  const { data: members } = await supabase.from('members').select('*').eq('active',true).not('role','in','("superadmin","admin")')
+  const { data: existing } = await supabase.from('attendance').select('member_id').eq('date', today)
+  const checkedInIds = new Set((existing||[]).map(a=>a.member_id))
+  const toMark = (members||[]).filter(m => !checkedInIds.has(m.id))
+  if (!toMark.length) { toast('No absent members to mark'); return }
+  const rows = toMark.map(m => ({ member_id:m.id, member_name:m.name, date:today, status:'absent', marked_by:'auto' }))
+  await supabase.from('attendance').upsert(rows, { onConflict:'member_id,date' })
+  toast(`Marked ${toMark.length} member(s) absent ✓`,'success')
+  if (adminView==='dashboard') loadDashboard()
 }
 
 window.changeOwnPassword = async function() {
@@ -846,7 +936,7 @@ window.exportPerfCSV = async function() {
   const headers=['Member','Present','Late','On Leave','Absent','Total Days','Attendance %']
   const rows=(members||[]).map(m=>{
     const ma=(att||[]).filter(a=>a.member_id===m.id)
-    const p=ma.filter(a=>a.status==='present').length
+    const p=ma.filter(a=>a.status==='present'||a.status==='on_time').length
     const l=ma.filter(a=>a.status==='late').length
     const o=ma.filter(a=>a.status==='on_leave').length
     const ab=ma.filter(a=>a.status==='absent').length

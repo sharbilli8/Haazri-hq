@@ -315,6 +315,7 @@ tbody tr:hover td { background: rgba(0,212,170,0.03); }
 
 /* ─── BADGES ─────────────────────────────────────────────────── */
 .badge { display: inline-flex; align-items: center; gap: 4px; font-size: 11px; font-weight: 600; padding: 3px 9px; border-radius: 99px; border: 1px solid; white-space: nowrap; }
+.b-on_time  { background: var(--teal-bg);   color: var(--teal);   border-color: var(--teal-border);  }
 .b-present  { background: var(--green-bg);  color: var(--green);  border-color: var(--green-border); }
 .b-late     { background: var(--amber-bg);  color: var(--amber);  border-color: var(--amber-border); }
 .b-on_leave { background: var(--blue-bg);   color: var(--blue);   border-color: var(--blue-border);  }
