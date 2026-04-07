@@ -82,33 +82,234 @@ function toast(msg, type='default') {
 }
 
 // ─── LOGIN ────────────────────────────────────────────────────
+let _clockRAF = null   // animation frame handle — cancel on navigation
+
 function renderLogin() {
+  if (_clockRAF) { cancelAnimationFrame(_clockRAF); _clockRAF = null }
+
   document.getElementById('app').innerHTML = `
   <div class="login-page">
-    <div class="login-box">
-      <div class="login-logo-row">
-        <div class="login-logo-icon">⏱</div>
-        <div>
-          <div class="login-logo-name">Haazri HQ</div>
-          <div class="login-logo-sub">attendance</div>
+    <div class="login-canvas-side" id="canvasSide">
+      <canvas id="clockCanvas"></canvas>
+      <div class="login-clock-brand">
+        <div class="lcb-name">Haazri HQ</div>
+        <div class="lcb-tag">Attendance System</div>
+        <div class="lcb-live-time" id="lcbTime"></div>
+      </div>
+    </div>
+    <div class="login-form-side">
+      <div class="login-form-inner">
+        <div class="login-form-logo">
+          <div class="login-form-logo-icon">⏱</div>
+          <div>
+            <div class="login-form-logo-text">Haazri HQ</div>
+            <div class="login-form-logo-sub">attendance</div>
+          </div>
         </div>
+        <div class="login-form-title">Welcome back</div>
+        <div class="login-form-sub">Sign in to your account.</div>
+        <div id="loginErr" class="error-banner"></div>
+        <div class="field-group">
+          <label class="field-label">Username</label>
+          <input type="text" id="lu" placeholder="your username" autocomplete="username" />
+        </div>
+        <div class="field-group">
+          <label class="field-label">Password</label>
+          <input type="password" id="lp" placeholder="••••••••" autocomplete="current-password" onkeydown="if(event.key==='Enter')doLogin()" />
+        </div>
+        <button class="btn btn-primary btn-full" id="loginBtn" onclick="doLogin()">Sign in</button>
+        <div class="login-note">First sign-in locks your account to this device.<br>Future logins from other devices will be blocked.</div>
       </div>
-      <div class="login-form-title">Welcome back</div>
-      <div class="login-form-sub">Sign in to continue.</div>
-      <div id="loginErr" class="error-banner"></div>
-      <div class="field-group">
-        <label class="field-label">Username</label>
-        <input type="text" id="lu" placeholder="your username" autocomplete="username" />
-      </div>
-      <div class="field-group">
-        <label class="field-label">Password</label>
-        <input type="password" id="lp" placeholder="••••••••" autocomplete="current-password" onkeydown="if(event.key==='Enter')doLogin()" />
-      </div>
-      <button class="btn btn-primary btn-full" id="loginBtn" onclick="doLogin()">Sign in</button>
-      <div class="login-note">First sign-in registers your device.<br>Only that device may be used for future logins.</div>
     </div>
   </div>`
+
+  // Kick off the canvas clock after DOM is ready
+  requestAnimationFrame(initClockCanvas)
 }
+
+function initClockCanvas() {
+  const canvas = document.getElementById('clockCanvas')
+  if (!canvas) return
+  const container = document.getElementById('canvasSide')
+  const ctx = canvas.getContext('2d')
+
+  function resize() {
+    canvas.width  = container.offsetWidth
+    canvas.height = container.offsetHeight
+  }
+  resize()
+  window.addEventListener('resize', resize)
+
+  // ── Concentric ring definitions ─────────────────────────────
+  // Each ring: radius fraction, speed (rad/s), tick count, opacity, color, width, direction
+  const rings = [
+    { r: 0.42, speed: 0.004,  ticks: 60, opacity: 0.08, color: '#00d4aa', lw: 0.5, dir: 1  },
+    { r: 0.38, speed: 0.012,  ticks: 12, opacity: 0.18, color: '#00d4aa', lw: 1.0, dir: -1 },
+    { r: 0.32, speed: 0.022,  ticks: 60, opacity: 0.10, color: '#f5a623', lw: 0.5, dir: 1  },
+    { r: 0.25, speed: 0.040,  ticks: 12, opacity: 0.22, color: '#f5a623', lw: 1.2, dir: -1 },
+    { r: 0.17, speed: 0.080,  ticks: 60, opacity: 0.08, color: '#00d4aa', lw: 0.5, dir: 1  },
+    { r: 0.10, speed: 0.200,  ticks:  4, opacity: 0.28, color: '#00d4aa', lw: 1.5, dir: -1 },
+  ]
+  // Arc progress bands — decorative arcs that sweep around rings
+  const bands = [
+    { r: 0.38, speed: 0.018, phase: 0,    arc: 0.55, color: '#00d4aa', lw: 2.5, dir:  1 },
+    { r: 0.25, speed: 0.045, phase: 2.1,  arc: 0.35, color: '#f5a623', lw: 2.0, dir: -1 },
+    { r: 0.17, speed: 0.090, phase: 4.3,  arc: 0.20, color: '#00d4aa', lw: 1.5, dir:  1 },
+  ]
+  // Glowing dots orbiting
+  const dots = [
+    { r: 0.38, speed: 0.018, phase: 0,   size: 4, color: '#00d4aa', glow: 'rgba(0,212,170,0.6)'  },
+    { r: 0.38, speed: 0.018, phase: Math.PI, size: 3, color: '#00d4aa', glow: 'rgba(0,212,170,0.4)' },
+    { r: 0.25, speed: 0.045, phase: 1.2, size: 5, color: '#f5a623', glow: 'rgba(245,166,35,0.6)' },
+    { r: 0.25, speed: 0.045, phase: 3.8, size: 3, color: '#f5a623', glow: 'rgba(245,166,35,0.4)' },
+    { r: 0.17, speed: 0.090, phase: 2.5, size: 3, color: '#fff',    glow: 'rgba(255,255,255,0.3)' },
+    { r: 0.10, speed: 0.200, phase: 0,   size: 4, color: '#00d4aa', glow: 'rgba(0,212,170,0.8)'  },
+  ]
+  // Center hub spokes
+  const spokeCount = 12
+
+  let t = 0
+  let prevTime = null
+
+  function draw(timestamp) {
+    if (!document.getElementById('clockCanvas')) return  // navigated away
+
+    const dt = prevTime ? Math.min((timestamp - prevTime) / 1000, 0.05) : 0.016
+    prevTime = timestamp
+    t += dt
+
+    const W = canvas.width
+    const H = canvas.height
+    const cx = W / 2
+    const cy = H / 2
+    const minDim = Math.min(W, H)
+
+    ctx.clearRect(0, 0, W, H)
+
+    // ── Background radial vignette ──────────────────────────────
+    const vign = ctx.createRadialGradient(cx, cy, 0, cx, cy, minDim * 0.6)
+    vign.addColorStop(0, 'rgba(0,40,32,0.25)')
+    vign.addColorStop(1, 'rgba(0,0,0,0)')
+    ctx.fillStyle = vign; ctx.fillRect(0, 0, W, H)
+
+    // ── Concentric rings with tick marks ───────────────────────
+    rings.forEach(ring => {
+      const rad  = minDim * ring.r
+      const angle = ring.dir * ring.speed * t * 60  // angle offset over time
+
+      ctx.save()
+      ctx.translate(cx, cy)
+      ctx.rotate(angle)
+
+      // Ring circle
+      ctx.beginPath()
+      ctx.arc(0, 0, rad, 0, Math.PI * 2)
+      ctx.strokeStyle = ring.color
+      ctx.globalAlpha = ring.opacity
+      ctx.lineWidth   = ring.lw
+      ctx.stroke()
+
+      // Tick marks
+      for (let i = 0; i < ring.ticks; i++) {
+        const a     = (i / ring.ticks) * Math.PI * 2
+        const isMaj = i % (ring.ticks / 4) === 0
+        const len   = isMaj ? 10 : 5
+        const x1    = Math.cos(a) * (rad - len / 2)
+        const y1    = Math.sin(a) * (rad - len / 2)
+        const x2    = Math.cos(a) * (rad + len / 2)
+        const y2    = Math.sin(a) * (rad + len / 2)
+        ctx.beginPath()
+        ctx.moveTo(x1, y1); ctx.lineTo(x2, y2)
+        ctx.globalAlpha = isMaj ? ring.opacity * 3 : ring.opacity * 1.5
+        ctx.lineWidth   = isMaj ? ring.lw * 1.5 : ring.lw
+        ctx.stroke()
+      }
+      ctx.restore()
+    })
+
+    // ── Sweep arcs (progress band style) ───────────────────────
+    ctx.globalAlpha = 1
+    bands.forEach(band => {
+      const rad    = minDim * band.r
+      const startA = band.dir * band.speed * t * 60 + band.phase
+      const endA   = startA + Math.PI * 2 * band.arc
+
+      ctx.save()
+      ctx.translate(cx, cy)
+      ctx.beginPath()
+      ctx.arc(0, 0, rad, startA, endA)
+      ctx.strokeStyle = band.color
+      ctx.lineWidth   = band.lw
+      ctx.globalAlpha = 0.55
+      ctx.lineCap     = 'round'
+      ctx.stroke()
+      ctx.restore()
+    })
+
+    // ── Orbiting glowing dots ───────────────────────────────────
+    ctx.globalAlpha = 1
+    dots.forEach(dot => {
+      const rad = minDim * dot.r
+      const a   = dot.speed * t * 60 + dot.phase
+      const dx  = cx + Math.cos(a) * rad
+      const dy  = cy + Math.sin(a) * rad
+
+      // Glow halo
+      const gr = ctx.createRadialGradient(dx, dy, 0, dx, dy, dot.size * 4)
+      gr.addColorStop(0, dot.glow)
+      gr.addColorStop(1, 'transparent')
+      ctx.beginPath()
+      ctx.arc(dx, dy, dot.size * 4, 0, Math.PI * 2)
+      ctx.fillStyle = gr
+      ctx.fill()
+
+      // Core dot
+      ctx.beginPath()
+      ctx.arc(dx, dy, dot.size * 0.7, 0, Math.PI * 2)
+      ctx.fillStyle = dot.color
+      ctx.fill()
+    })
+
+    // ── Center hub ──────────────────────────────────────────────
+    const hubR = minDim * 0.06
+    // Spokes
+    ctx.save()
+    ctx.translate(cx, cy)
+    ctx.rotate(t * 0.3)
+    for (let i = 0; i < spokeCount; i++) {
+      const a = (i / spokeCount) * Math.PI * 2
+      ctx.beginPath()
+      ctx.moveTo(0, 0)
+      ctx.lineTo(Math.cos(a) * hubR, Math.sin(a) * hubR)
+      ctx.strokeStyle = '#00d4aa'
+      ctx.globalAlpha = 0.12
+      ctx.lineWidth   = 0.8
+      ctx.stroke()
+    }
+    // Hub glow
+    const hubGlow = ctx.createRadialGradient(0, 0, 0, 0, 0, hubR)
+    hubGlow.addColorStop(0, 'rgba(0,212,170,0.35)')
+    hubGlow.addColorStop(1, 'transparent')
+    ctx.beginPath(); ctx.arc(0, 0, hubR, 0, Math.PI * 2)
+    ctx.fillStyle = hubGlow; ctx.globalAlpha = 1; ctx.fill()
+    // Hub dot
+    ctx.beginPath(); ctx.arc(0, 0, 3, 0, Math.PI * 2)
+    ctx.fillStyle = '#00d4aa'; ctx.fill()
+    ctx.restore()
+
+    // ── Live time overlay (big faint numbers) ───────────────────
+    const timeEl = document.getElementById('lcbTime')
+    if (timeEl) {
+      const now = new Date()
+      timeEl.textContent = now.toLocaleTimeString('en-US', { hour12: false, hour:'2-digit', minute:'2-digit', second:'2-digit' })
+    }
+
+    _clockRAF = requestAnimationFrame(draw)
+  }
+
+  _clockRAF = requestAnimationFrame(draw)
+}
+
 
 window.doLogin = async function() {
   const username = document.getElementById('lu').value.trim().toLowerCase()
@@ -144,6 +345,7 @@ window.doLogin = async function() {
   localStorage.setItem('hq_token', token)
   currentUser = member; currentToken = token
   await loadOfficeTime()
+  if (_clockRAF) { cancelAnimationFrame(_clockRAF); _clockRAF = null }
   if (isAdmin()) renderAdmin()
   else            renderMemberPage()
 }
