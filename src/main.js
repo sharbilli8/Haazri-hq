@@ -345,12 +345,14 @@ window.doLogin = async function() {
   localStorage.setItem('hq_token', token)
   currentUser = member; currentToken = token
   await loadOfficeTime()
-  if (_clockRAF) { cancelAnimationFrame(_clockRAF); _clockRAF = null }
+  if (_clockRAF)    { cancelAnimationFrame(_clockRAF); _clockRAF = null }
+  if (_memberRingRAF) { cancelAnimationFrame(_memberRingRAF); _memberRingRAF = null }
   if (isAdmin()) renderAdmin()
   else            renderMemberPage()
 }
 
 window.doLogout = async function() {
+  if (_memberRingRAF) { cancelAnimationFrame(_memberRingRAF); _memberRingRAF = null }
   if (currentToken) await supabase.from('sessions').delete().eq('token', currentToken)
   localStorage.removeItem('hq_token')
   currentUser = currentToken = null
@@ -358,14 +360,21 @@ window.doLogout = async function() {
 }
 
 // ─── MEMBER CHECK-IN / CHECK-OUT PAGE ─────────────────────────
+let _memberRingRAF = null   // bg ring animation handle
+let _ringsFrozen    = false  // true after check-in
+
 async function renderMemberPage() {
+  if (_memberRingRAF) { cancelAnimationFrame(_memberRingRAF); _memberRingRAF = null }
+  _ringsFrozen = false
+
   const today = todayStr()
   const { data: record } = await supabase.from('attendance')
     .select('*').eq('member_id', currentUser.id).eq('date', today).single()
 
   document.getElementById('app').innerHTML = `
-  <div class="checkin-page">
-    <div class="checkin-card">
+  <div class="checkin-page" style="position:relative;overflow:hidden;">
+    <canvas id="memberBgCanvas" style="position:fixed;inset:0;width:100%;height:100%;pointer-events:none;z-index:0;"></canvas>
+    <div class="checkin-card" style="position:relative;z-index:2;">
       <div class="checkin-topbar">
         <div class="checkin-logo">
           <div class="checkin-logo-icon">⏱</div>
@@ -390,7 +399,127 @@ async function renderMemberPage() {
   </div>`
 
   setInterval(tickClock, 1000); tickClock()
+  startMemberBgRings()
   renderAttendanceContent(record)
+}
+
+function startMemberBgRings() {
+  const canvas = document.getElementById('memberBgCanvas')
+  if (!canvas) return
+  const ctx = canvas.getContext('2d')
+
+  function resize() { canvas.width = window.innerWidth; canvas.height = window.innerHeight }
+  resize()
+  window.addEventListener('resize', resize)
+
+  // Same ring definitions as login page but slightly dimmer / adapted
+  const rings = [
+    { r:0.42, speed:0.004,  ticks:60, opacity:0.05, color:'#00d4aa', lw:0.5, dir: 1 },
+    { r:0.36, speed:0.012,  ticks:12, opacity:0.10, color:'#00d4aa', lw:1.0, dir:-1 },
+    { r:0.28, speed:0.022,  ticks:60, opacity:0.06, color:'#f5a623', lw:0.5, dir: 1 },
+    { r:0.20, speed:0.040,  ticks:12, opacity:0.12, color:'#f5a623', lw:1.2, dir:-1 },
+    { r:0.13, speed:0.080,  ticks:60, opacity:0.05, color:'#00d4aa', lw:0.5, dir: 1 },
+    { r:0.07, speed:0.200,  ticks: 4, opacity:0.14, color:'#00d4aa', lw:1.5, dir:-1 },
+  ]
+  const bands = [
+    { r:0.36, speed:0.018, phase:0,   arc:0.55, color:'#00d4aa', lw:2.0, dir: 1 },
+    { r:0.20, speed:0.045, phase:2.1, arc:0.35, color:'#f5a623', lw:1.5, dir:-1 },
+  ]
+  const dots = [
+    { r:0.36, speed:0.018, phase:0,         size:3.5, color:'#00d4aa', glow:'rgba(0,212,170,0.5)' },
+    { r:0.36, speed:0.018, phase:Math.PI,   size:2.5, color:'#00d4aa', glow:'rgba(0,212,170,0.3)' },
+    { r:0.20, speed:0.045, phase:1.2,       size:4,   color:'#f5a623', glow:'rgba(245,166,35,0.5)' },
+    { r:0.07, speed:0.200, phase:0,         size:3,   color:'#00d4aa', glow:'rgba(0,212,170,0.7)' },
+  ]
+
+  let t = 0, frozenT = 0, prevTime = null
+
+  function draw(timestamp) {
+    if (!document.getElementById('memberBgCanvas')) return
+    const dt = prevTime ? Math.min((timestamp - prevTime) / 1000, 0.05) : 0.016
+    prevTime = timestamp
+
+    // When frozen, t stops advancing — rings are locked in place
+    if (!_ringsFrozen) { t += dt } else { frozenT += dt }
+
+    const W = canvas.width, H = canvas.height
+    const cx = W / 2, cy = H / 2
+    const minDim = Math.min(W, H)
+
+    ctx.clearRect(0, 0, W, H)
+
+    // Rings
+    rings.forEach(ring => {
+      const rad   = minDim * ring.r
+      const angle = ring.dir * ring.speed * t * 60
+
+      ctx.save(); ctx.translate(cx, cy); ctx.rotate(angle)
+      ctx.beginPath(); ctx.arc(0, 0, rad, 0, Math.PI * 2)
+      ctx.strokeStyle = ring.color; ctx.globalAlpha = ring.opacity
+      ctx.lineWidth = ring.lw; ctx.stroke()
+
+      for (let i = 0; i < ring.ticks; i++) {
+        const a = (i / ring.ticks) * Math.PI * 2
+        const isMaj = i % (ring.ticks / 4) === 0
+        const len = isMaj ? 8 : 4
+        ctx.beginPath()
+        ctx.moveTo(Math.cos(a)*(rad-len/2), Math.sin(a)*(rad-len/2))
+        ctx.lineTo(Math.cos(a)*(rad+len/2), Math.sin(a)*(rad+len/2))
+        ctx.globalAlpha = isMaj ? ring.opacity*3 : ring.opacity*1.5
+        ctx.lineWidth = isMaj ? ring.lw*1.5 : ring.lw
+        ctx.stroke()
+      }
+      ctx.restore()
+    })
+
+    // Sweep bands
+    ctx.globalAlpha = 1
+    bands.forEach(band => {
+      const rad = minDim * band.r
+      const startA = band.dir * band.speed * t * 60 + band.phase
+      ctx.save(); ctx.translate(cx, cy)
+      ctx.beginPath(); ctx.arc(0, 0, rad, startA, startA + Math.PI * 2 * band.arc)
+      ctx.strokeStyle = band.color; ctx.lineWidth = band.lw
+      ctx.globalAlpha = 0.35; ctx.lineCap = 'round'; ctx.stroke()
+      ctx.restore()
+    })
+
+    // Orbiting dots
+    ctx.globalAlpha = 1
+    dots.forEach(dot => {
+      const rad = minDim * dot.r
+      const a = dot.speed * t * 60 + dot.phase
+      const dx = cx + Math.cos(a) * rad, dy = cy + Math.sin(a) * rad
+      const gr = ctx.createRadialGradient(dx, dy, 0, dx, dy, dot.size * 3)
+      gr.addColorStop(0, dot.glow); gr.addColorStop(1, 'transparent')
+      ctx.beginPath(); ctx.arc(dx, dy, dot.size * 3, 0, Math.PI * 2)
+      ctx.fillStyle = gr; ctx.fill()
+      ctx.beginPath(); ctx.arc(dx, dy, dot.size * 0.6, 0, Math.PI * 2)
+      ctx.fillStyle = dot.color; ctx.fill()
+    })
+
+    // Center hub
+    const hubR = minDim * 0.04
+    ctx.save(); ctx.translate(cx, cy); ctx.rotate(t * 0.3)
+    for (let i = 0; i < 12; i++) {
+      const a = (i / 12) * Math.PI * 2
+      ctx.beginPath(); ctx.moveTo(0, 0)
+      ctx.lineTo(Math.cos(a)*hubR, Math.sin(a)*hubR)
+      ctx.strokeStyle = '#00d4aa'; ctx.globalAlpha = 0.08
+      ctx.lineWidth = 0.8; ctx.stroke()
+    }
+    const hg = ctx.createRadialGradient(0,0,0,0,0,hubR)
+    hg.addColorStop(0,'rgba(0,212,170,0.20)'); hg.addColorStop(1,'transparent')
+    ctx.beginPath(); ctx.arc(0,0,hubR,0,Math.PI*2)
+    ctx.fillStyle = hg; ctx.globalAlpha = 1; ctx.fill()
+    ctx.beginPath(); ctx.arc(0,0,2.5,0,Math.PI*2)
+    ctx.fillStyle = '#00d4aa'; ctx.fill()
+    ctx.restore()
+
+    _memberRingRAF = requestAnimationFrame(draw)
+  }
+
+  _memberRingRAF = requestAnimationFrame(draw)
 }
 
 function tickClock() {
@@ -415,8 +544,7 @@ function renderAttendanceContent(record) {
     const sc = statusConf[record.status] || statusConf.present
     const checkedOut = !!record.check_out_time
     el.innerHTML = `
-      <canvas id="attCanvas" style="position:fixed;inset:0;width:100%;height:100%;pointer-events:none;z-index:10;"></canvas>
-      <div class="status-result ${sc.cls}" style="position:relative;z-index:20;">
+      <div class="status-result ${sc.cls}" id="statusCard">
         <div class="sr-icon">${sc.icon}</div>
         <div class="sr-status" style="color:${sc.color};">${sc.label}</div>
         <div class="sr-time">
@@ -425,22 +553,23 @@ function renderAttendanceContent(record) {
         </div>
       </div>
       ${!checkedOut && (record.status === 'present' || record.status === 'late' || record.status === 'on_time') ? `
-        <button class="btn btn-amber btn-full" style="position:relative;z-index:20;" onclick="doCheckOut('${record.id}')">
+        <button class="btn btn-amber btn-full" onclick="doCheckOut('${record.id}')">
           🚪 Check out
         </button>
-        <div style="font-size:11.5px;color:var(--text3);text-align:center;margin-top:8px;position:relative;z-index:20;">
+        <div style="font-size:11.5px;color:var(--text3);text-align:center;margin-top:8px;">
           Tap when leaving for the day
         </div>
       ` : checkedOut ? `
-        <div style="text-align:center;font-size:13px;color:var(--text3);padding:10px 0;position:relative;z-index:20;">
+        <div style="text-align:center;font-size:13px;color:var(--text3);padding:10px 0;">
           ✅ All done for today. See you tomorrow!
         </div>
       ` : ''}
     `
-    // Play animation after DOM paint
+    // Freeze rings and play mood flash
     requestAnimationFrame(() => {
-      if (sc.anim === 'glory') playGloryAnimation()
-      if (sc.anim === 'late')  playLateAnimation()
+      _ringsFrozen = true
+      if (sc.anim === 'glory') playGloryMood()
+      if (sc.anim === 'late')  playLateMood()
     })
   } else {
     el.innerHTML = `
@@ -1140,94 +1269,149 @@ function dlCSV(fname, headers, rows) {
 }
 
 
-// ── Glory animation — golden sparks + rising stars ────────────
-function playGloryAnimation() {
-  const canvas = document.getElementById('attCanvas'); if (!canvas) return
-  const ctx = canvas.getContext('2d')
-  canvas.width = window.innerWidth; canvas.height = window.innerHeight
-  const CX = canvas.width / 2, CY = canvas.height / 2
-  const colors = ['#ffd700','#ffec60','#00d4aa','#ffffff','#f5a623','#aaffdd']
-  const particles = Array.from({ length: 90 }, () => {
-    const angle = Math.random() * Math.PI * 2
-    const speed = 2 + Math.random() * 6
-    return { x:CX, y:CY, vx:Math.cos(angle)*speed, vy:Math.sin(angle)*speed-(1+Math.random()*3),
-             size:2+Math.random()*5, color:colors[Math.floor(Math.random()*colors.length)],
-             life:1, decay:0.012+Math.random()*0.018, rot:0, spin:(Math.random()-0.5)*0.3,
-             shape:Math.random()<0.4?'star':'circle' }
-  })
-  let textY = CY - 80, textAlpha = 1, frame = 0
+// ── Glory mood — rings freeze, golden flash + card glow ─────────
+function playGloryMood() {
+  // Golden background pulse — overlay canvas
+  const overlay = document.createElement('canvas')
+  overlay.style.cssText = 'position:fixed;inset:0;width:100%;height:100%;pointer-events:none;z-index:5;'
+  overlay.width  = window.innerWidth
+  overlay.height = window.innerHeight
+  document.body.appendChild(overlay)
+  const ctx = overlay.getContext('2d')
+
+  // Ring burst — 4 concentric golden rings expanding outward from center
+  const CX = overlay.width / 2, CY = overlay.height / 2
+  const burstRings = [
+    { r: 0,    maxR: Math.min(CX, CY) * 0.55, delay: 0   },
+    { r: 0,    maxR: Math.min(CX, CY) * 0.75, delay: 6   },
+    { r: 0,    maxR: Math.min(CX, CY) * 0.95, delay: 12  },
+    { r: 0,    maxR: Math.min(CX, CY) * 1.20, delay: 18  },
+  ]
+
+  let frame = 0
+  const totalFrames = 80
+
   function tick() {
-    if (!document.getElementById('attCanvas')) return
-    ctx.clearRect(0, 0, canvas.width, canvas.height)
-    let alive = 0
-    for (const p of particles) {
-      if (p.life <= 0) continue; alive++
-      p.x += p.vx; p.y += p.vy; p.vy += 0.12; p.life -= p.decay; p.rot += p.spin
-      ctx.globalAlpha = Math.max(0, p.life)
-      if (p.shape === 'star') {
-        ctx.save(); ctx.translate(p.x, p.y); ctx.rotate(p.rot)
-        ctx.beginPath()
-        for (let i = 0; i < 10; i++) {
-          const a = (i / 10) * Math.PI * 2 - Math.PI / 2
-          const r = i % 2 === 0 ? p.size : p.size * 0.45
-          i === 0 ? ctx.moveTo(Math.cos(a)*r, Math.sin(a)*r) : ctx.lineTo(Math.cos(a)*r, Math.sin(a)*r)
-        }
-        ctx.closePath(); ctx.fillStyle = p.color; ctx.fill(); ctx.restore()
-      } else {
-        ctx.beginPath(); ctx.arc(p.x, p.y, p.size * p.life, 0, Math.PI*2)
-        ctx.fillStyle = p.color; ctx.fill()
-      }
+    if (!overlay.parentNode) return
+    ctx.clearRect(0, 0, overlay.width, overlay.height)
+
+    // Background golden tint — peaks at frame 12, fades out
+    const bgAlpha = frame < 12
+      ? (frame / 12) * 0.18
+      : Math.max(0, 0.18 - ((frame - 12) / 50) * 0.18)
+    ctx.fillStyle = `rgba(255, 210, 50, ${bgAlpha})`
+    ctx.fillRect(0, 0, overlay.width, overlay.height)
+
+    // Expanding rings — golden
+    for (const ring of burstRings) {
+      const f = frame - ring.delay
+      if (f < 0) continue
+      ring.r = Math.min(ring.maxR, f * (ring.maxR / 45))
+      const progress = ring.r / ring.maxR
+      const alpha = Math.max(0, (1 - progress) * 0.7)
+      ctx.beginPath()
+      ctx.arc(CX, CY, ring.r, 0, Math.PI * 2)
+      ctx.strokeStyle = `rgba(255, 210, 50, ${alpha})`
+      ctx.lineWidth = 2.5 * (1 - progress * 0.7)
+      ctx.stroke()
     }
-    if (frame < 120) {
-      textY -= 0.45; textAlpha = Math.max(0, 1 - frame / 85)
-      ctx.globalAlpha = textAlpha
-      ctx.font = 'bold 28px Inter, sans-serif'; ctx.textAlign = 'center'
-      ctx.shadowColor = 'rgba(255,215,0,0.9)'; ctx.shadowBlur = 22
-      ctx.fillStyle = '#ffd700'; ctx.fillText('\uD83C\uDF1F ON TIME!', CX, textY)
-      ctx.shadowBlur = 0
+
+    // Status card glow — golden border shimmer
+    const card = document.getElementById('statusCard')
+    if (card) {
+      const glowStrength = frame < 20
+        ? (frame / 20)
+        : Math.max(0, 1 - (frame - 20) / 45)
+      const gs = Math.round(glowStrength * 32)
+      card.style.boxShadow = gs > 1
+        ? `0 0 ${gs}px rgba(255,210,50,${glowStrength * 0.6}), 0 0 ${gs*2}px rgba(255,180,0,${glowStrength * 0.25})`
+        : ''
+      card.style.borderColor = glowStrength > 0.1
+        ? `rgba(255,210,50,${glowStrength * 0.8})`
+        : ''
     }
-    ctx.globalAlpha = 1; frame++
-    if (alive > 0 || frame < 130) requestAnimationFrame(tick)
-    else { ctx.clearRect(0, 0, canvas.width, canvas.height); canvas.remove() }
+
+    frame++
+    if (frame < totalFrames) requestAnimationFrame(tick)
+    else {
+      overlay.remove()
+      if (card) { card.style.boxShadow = ''; card.style.borderColor = '' }
+    }
   }
+
   requestAnimationFrame(tick)
 }
 
-// ── Late animation — amber rain + drooping text ───────────────
-function playLateAnimation() {
-  const canvas = document.getElementById('attCanvas'); if (!canvas) return
-  const ctx = canvas.getContext('2d')
-  canvas.width = window.innerWidth; canvas.height = window.innerHeight
-  const W = canvas.width, H = canvas.height, CX = W / 2, CY = H / 2
-  const drops = Array.from({ length: 55 }, () => ({
-    x: Math.random() * W, y: -20 - Math.random() * H * 0.5,
-    len: 8 + Math.random() * 18, speed: 1.8 + Math.random() * 2.2,
-    alpha: 0.12 + Math.random() * 0.3,
-    color: Math.random() < 0.5 ? '#f5a623' : '#e67e22'
-  }))
-  let textY = CY - 50, textAlpha = 0, frame = 0
+// ── Late mood — rings freeze, dark red flash + card red glow ─────
+function playLateMood() {
+  const overlay = document.createElement('canvas')
+  overlay.style.cssText = 'position:fixed;inset:0;width:100%;height:100%;pointer-events:none;z-index:5;'
+  overlay.width  = window.innerWidth
+  overlay.height = window.innerHeight
+  document.body.appendChild(overlay)
+  const ctx = overlay.getContext('2d')
+
+  const CX = overlay.width / 2, CY = overlay.height / 2
+
+  // Contracting rings — deep red closing inward (opposite of glory)
+  const contractRings = [
+    { r: Math.min(CX,CY)*1.20, minR: 0, delay: 0  },
+    { r: Math.min(CX,CY)*0.95, minR: 0, delay: 5  },
+    { r: Math.min(CX,CY)*0.70, minR: 0, delay: 10 },
+  ]
+
+  let frame = 0
+  const totalFrames = 75
+
   function tick() {
-    if (!document.getElementById('attCanvas')) return
-    ctx.clearRect(0, 0, W, H)
-    ctx.fillStyle = 'rgba(22,8,0,0.14)'; ctx.fillRect(0, 0, W, H)
-    for (const d of drops) {
-      d.y += d.speed
-      if (d.y - d.len > H) { d.y = -d.len; d.x = Math.random() * W }
-      ctx.beginPath(); ctx.moveTo(d.x, d.y); ctx.lineTo(d.x - d.speed*0.3, d.y - d.len)
-      ctx.strokeStyle = d.color; ctx.globalAlpha = d.alpha; ctx.lineWidth = 1.2; ctx.stroke()
+    if (!overlay.parentNode) return
+    ctx.clearRect(0, 0, overlay.width, overlay.height)
+
+    // Dark red background tint — slightly slower fade
+    const bgAlpha = frame < 15
+      ? (frame / 15) * 0.20
+      : Math.max(0, 0.20 - ((frame - 15) / 48) * 0.20)
+    ctx.fillStyle = `rgba(180, 20, 20, ${bgAlpha})`
+    ctx.fillRect(0, 0, overlay.width, overlay.height)
+
+    // Contracting rings — closing inward
+    for (const ring of contractRings) {
+      const f = frame - ring.delay
+      if (f < 0) continue
+      const progress = Math.min(1, f / 50)
+      const currentR = ring.r * (1 - progress)
+      if (currentR < 2) continue
+      const alpha = Math.max(0, (1 - progress) * 0.65)
+      ctx.beginPath()
+      ctx.arc(CX, CY, currentR, 0, Math.PI * 2)
+      ctx.strokeStyle = `rgba(220, 50, 50, ${alpha})`
+      ctx.lineWidth = 2.0 * (1 - progress * 0.5)
+      ctx.stroke()
     }
-    textAlpha = Math.min(1, frame / 30) * Math.max(0, 1 - (frame - 90) / 60)
-    const droop = frame < 30 ? (1 - frame / 30) * 15 : 0
-    ctx.globalAlpha = textAlpha
-    ctx.font = 'bold 26px Inter, sans-serif'; ctx.textAlign = 'center'
-    ctx.shadowColor = 'rgba(245,166,35,0.7)'; ctx.shadowBlur = 18
-    ctx.fillStyle = '#f5a623'
-    ctx.fillText("\uD83D\uDD50 You're late\u2026", CX, textY + droop)
-    ctx.shadowBlur = 0
-    ctx.globalAlpha = 1; frame++
-    if (frame < 190) requestAnimationFrame(tick)
-    else { ctx.clearRect(0, 0, W, H); canvas.remove() }
+
+    // Status card red glow
+    const card = document.getElementById('statusCard')
+    if (card) {
+      const glowStrength = frame < 18
+        ? (frame / 18)
+        : Math.max(0, 1 - (frame - 18) / 42)
+      const gs = Math.round(glowStrength * 28)
+      card.style.boxShadow = gs > 1
+        ? `0 0 ${gs}px rgba(220,50,50,${glowStrength * 0.5}), 0 0 ${gs*2}px rgba(180,20,20,${glowStrength * 0.22})`
+        : ''
+      card.style.borderColor = glowStrength > 0.1
+        ? `rgba(220,50,50,${glowStrength * 0.7})`
+        : ''
+    }
+
+    frame++
+    if (frame < totalFrames) requestAnimationFrame(tick)
+    else {
+      overlay.remove()
+      if (card) { card.style.boxShadow = ''; card.style.borderColor = '' }
+    }
   }
+
   requestAnimationFrame(tick)
 }
 
