@@ -6,9 +6,9 @@ import { getDeviceFingerprint, hashPassword } from './fingerprint.js'
 let currentUser  = null
 let currentToken = null
 let deviceFP     = null
-let officeStart      = '09:00'   // HH:MM
-let officeEnd        = '18:00'   // HH:MM
-let absentAfterHours = 2          // hours after start before auto-absent
+let officeStart = '09:00'
+let officeEnd   = '18:00'
+let lateTime    = '09:00'   // check-ins after this = late (settable separately)
 let adminView    = 'dashboard'
 
 // ─── Boot ─────────────────────────────────────────────────────
@@ -46,21 +46,21 @@ const isSuperAdmin = () => currentUser?.role === 'superadmin'
 const rand = (n=32) => Array.from(crypto.getRandomValues(new Uint8Array(n))).map(b=>b.toString(16).padStart(2,'0')).join('')
 
 async function loadOfficeTime() {
-  const { data: rows } = await supabase.from('settings').select('*').in('key',['office_start_time','office_end_time','absent_after_hours'])
+  const { data: rows } = await supabase.from('settings').select('*').in('key',['office_start_time','office_end_time','late_time'])
   if (!rows) return
   for (const r of rows) {
     const v = typeof r.value === 'string' ? r.value.replace(/"/g,'') : r.value
-    if (r.key === 'office_start_time')  officeStart      = v
-    if (r.key === 'office_end_time')    officeEnd        = v
-    if (r.key === 'absent_after_hours') absentAfterHours = Number(v) || 2
+    if (r.key === 'office_start_time') officeStart = v
+    if (r.key === 'office_end_time')   officeEnd   = v
+    if (r.key === 'late_time')         lateTime    = v
   }
 }
 
 function isLate(checkinTime) {
   if (!checkinTime) return false
-  const [oh, om] = officeStart.split(':').map(Number)
+  const [lh, lm] = lateTime.split(':').map(Number)
   const d = new Date(checkinTime)
-  return d.getHours() > oh || (d.getHours() === oh && d.getMinutes() > om)
+  return d.getHours() > lh || (d.getHours() === lh && d.getMinutes() > lm)
 }
 // 'on_time' status: checked in at or before officeStart
 function checkinStatus(checkinTime) {
@@ -382,7 +382,7 @@ async function renderMemberPage() {
       <div class="clock-display">
         <div class="clock-time" id="lc">--:--:--</div>
         <div class="clock-date" id="ld"></div>
-        <div class="clock-office">Office starts at <strong>${officeStart}</strong></div>
+        <div class="clock-office">Start: <strong>${officeStart}</strong>&ensp;·&ensp;Late after: <strong>${lateTime}</strong></div>
       </div>
 
       <div id="attendanceContent"></div>
@@ -406,16 +406,17 @@ function renderAttendanceContent(record) {
 
   if (record) {
     const statusConf = {
-      on_time: { cls:'sr-present', icon:'🟢', label:'Present · On time', color:'var(--green)' },
-      present: { cls:'sr-present', icon:'✅', label:'Present',            color:'var(--green)' },
-      late:    { cls:'sr-late',    icon:'🕐', label:'Present · Late',     color:'var(--amber)' },
-      absent:  { cls:'sr-absent',  icon:'❌', label:'Absent',             color:'var(--red)'   },
-      on_leave:{ cls:'sr-leave',   icon:'🏖', label:'On Leave',           color:'var(--blue)'  },
+      on_time: { cls:'sr-present', icon:'🟢', label:'Present · On time', color:'var(--green)', anim:'glory' },
+      present: { cls:'sr-present', icon:'✅', label:'Present',            color:'var(--green)', anim:'glory' },
+      late:    { cls:'sr-late',    icon:'🕐', label:'Present · Late',     color:'var(--amber)', anim:'late'  },
+      absent:  { cls:'sr-absent',  icon:'❌', label:'Absent',             color:'var(--red)',   anim:'none'  },
+      on_leave:{ cls:'sr-leave',   icon:'🏖', label:'On Leave',           color:'var(--blue)',  anim:'none'  },
     }
     const sc = statusConf[record.status] || statusConf.present
     const checkedOut = !!record.check_out_time
     el.innerHTML = `
-      <div class="status-result ${sc.cls}">
+      <canvas id="attCanvas" style="position:fixed;inset:0;width:100%;height:100%;pointer-events:none;z-index:10;"></canvas>
+      <div class="status-result ${sc.cls}" style="position:relative;z-index:20;">
         <div class="sr-icon">${sc.icon}</div>
         <div class="sr-status" style="color:${sc.color};">${sc.label}</div>
         <div class="sr-time">
@@ -424,18 +425,23 @@ function renderAttendanceContent(record) {
         </div>
       </div>
       ${!checkedOut && (record.status === 'present' || record.status === 'late' || record.status === 'on_time') ? `
-        <button class="btn btn-amber btn-full" onclick="doCheckOut('${record.id}')">
+        <button class="btn btn-amber btn-full" style="position:relative;z-index:20;" onclick="doCheckOut('${record.id}')">
           🚪 Check out
         </button>
-        <div style="font-size:11.5px;color:var(--text3);text-align:center;margin-top:8px;">
+        <div style="font-size:11.5px;color:var(--text3);text-align:center;margin-top:8px;position:relative;z-index:20;">
           Tap when leaving for the day
         </div>
       ` : checkedOut ? `
-        <div style="text-align:center;font-size:13px;color:var(--text3);padding:10px 0;">
+        <div style="text-align:center;font-size:13px;color:var(--text3);padding:10px 0;position:relative;z-index:20;">
           ✅ All done for today. See you tomorrow!
         </div>
       ` : ''}
     `
+    // Play animation after DOM paint
+    requestAnimationFrame(() => {
+      if (sc.anim === 'glory') playGloryAnimation()
+      if (sc.anim === 'late')  playLateAnimation()
+    })
   } else {
     el.innerHTML = `
       <div style="font-size:13px;color:var(--text2);text-align:center;margin-bottom:16px;">
@@ -639,22 +645,8 @@ window.toggleMenu = function(e, id) {
 document.addEventListener('click', () => document.querySelectorAll('.action-menu.open').forEach(m => m.classList.remove('open')))
 
 // ─── DASHBOARD ────────────────────────────────────────────────
-// Silent auto-absent — runs on dashboard load without toast
-async function _silentAutoAbsent() {
-  const today    = todayStr()
-  const now      = new Date()
-  const [oh, om] = officeStart.split(':').map(Number)
-  const cutoff   = new Date()
-  cutoff.setHours(oh + absentAfterHours, om, 0, 0)
-  if (now < cutoff) return  // cutoff not reached
-  const { data: members }  = await supabase.from('members').select('id,name').eq('active',true).not('role','in','("superadmin","admin")')
-  const { data: existing } = await supabase.from('attendance').select('member_id').eq('date', today)
-  const checkedInIds = new Set((existing||[]).map(a=>a.member_id))
-  const toMark = (members||[]).filter(m => !checkedInIds.has(m.id))
-  if (!toMark.length) return
-  const rows = toMark.map(m => ({ member_id:m.id, member_name:m.name, date:today, status:'absent', marked_by:'auto' }))
-  await supabase.from('attendance').upsert(rows, { onConflict:'member_id,date' })
-}
+// Auto-absent is now manual only — admin presses the button in Settings
+async function _silentAutoAbsent() { /* no-op */ }
 
 async function loadDashboard() {
   const el = document.getElementById('view-dashboard')
@@ -936,47 +928,45 @@ window.deleteMember = async function(id, name) {
 async function loadSettings() {
   const el = document.getElementById('view-settings')
   const { data: rows } = await supabase.from('settings').select('*')
-    .in('key',['office_start_time','office_end_time','absent_after_hours'])
+    .in('key',['office_start_time','office_end_time','late_time'])
   const smap = {}
   for (const r of rows||[]) smap[r.key] = (typeof r.value==='string' ? r.value : JSON.stringify(r.value)).replace(/"/g,'')
-  const start  = smap['office_start_time']  || '09:00'
-  const end    = smap['office_end_time']    || '18:00'
-  const aahrs  = smap['absent_after_hours'] || '2'
-
+  const startV = smap['office_start_time'] || '09:00'
+  const endV   = smap['office_end_time']   || '18:00'
+  const lateV  = smap['late_time']         || '09:00'
   el.innerHTML = `
-    <div class="page-header"><div><div class="page-title">Settings</div><div class="page-sub">System configuration — changes apply immediately to all future check-ins</div></div></div>
+    <div class="page-header"><div><div class="page-title">Settings</div><div class="page-sub">Changes apply immediately to all future check-ins</div></div></div>
     <div class="card">
       <div class="card-hdr"><span class="card-title">Office hours</span></div>
       <div class="card-body">
-        <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:16px;margin-bottom:18px;">
+        <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(170px,1fr));gap:16px;margin-bottom:20px;">
           <div class="fg" style="margin-bottom:0;">
             <label class="field-label">Office start time</label>
-            <input type="time" id="officeStartTime" value="${start}" />
-            <div style="font-size:11.5px;color:var(--text3);margin-top:4px;">Check-ins after this = Late</div>
+            <input type="time" id="officeStartTime" value="${startV}" />
+            <div style="font-size:11.5px;color:var(--text3);margin-top:4px;">Official start of the workday</div>
+          </div>
+          <div class="fg" style="margin-bottom:0;">
+            <label class="field-label">Late threshold</label>
+            <input type="time" id="lateTimeInput" value="${lateV}" />
+            <div style="font-size:11.5px;color:var(--text3);margin-top:4px;">Check-ins after this time = Late</div>
           </div>
           <div class="fg" style="margin-bottom:0;">
             <label class="field-label">Office end time</label>
-            <input type="time" id="officeEndTime" value="${end}" />
+            <input type="time" id="officeEndTime" value="${endV}" />
             <div style="font-size:11.5px;color:var(--text3);margin-top:4px;">Expected check-out time</div>
-          </div>
-          <div class="fg" style="margin-bottom:0;">
-            <label class="field-label">Auto-absent after (hours)</label>
-            <input type="number" id="absentAfterHrs" value="${aahrs}" min="1" max="12" style="max-width:100px;" />
-            <div style="font-size:11.5px;color:var(--text3);margin-top:4px;">Hours after start, no check-in = Absent</div>
           </div>
         </div>
         <button class="btn btn-primary btn-sm" onclick="saveOfficeSettings()">Save office settings</button>
       </div>
     </div>
     <div class="card">
-      <div class="card-hdr"><span class="card-title">Auto-absent rules</span></div>
+      <div class="card-hdr"><span class="card-title">Mark all absent</span></div>
       <div class="card-body">
         <p style="font-size:13px;color:var(--text2);margin-bottom:14px;line-height:1.6;">
-          When you open the dashboard, Haazri HQ automatically marks absent any member who has not checked in
-          within <strong style="color:var(--text)">${aahrs} hours</strong> of the office start time (<strong style="color:var(--text)">${start}</strong>).
-          This runs every time any admin loads the dashboard.
+          Press this button to immediately mark every member who has <strong style="color:var(--text);">not checked in today</strong> as <strong style="color:var(--red);">Absent</strong>.
+          Use this at end of day when the workday is clearly over.
         </p>
-        <button class="btn btn-ghost btn-sm" onclick="runAutoAbsent()">▶ Run auto-absent now</button>
+        <button class="btn btn-danger btn-sm" onclick="runMarkAllAbsent()">❌ Mark all absent now</button>
       </div>
     </div>
     ${isSuperAdmin() ? `
@@ -999,36 +989,28 @@ async function loadSettings() {
 window.saveOfficeSettings = async function() {
   const start = document.getElementById('officeStartTime')?.value
   const end   = document.getElementById('officeEndTime')?.value
-  const aah   = document.getElementById('absentAfterHrs')?.value
+  const late  = document.getElementById('lateTimeInput')?.value
   if (!start) { toast('Start time required','error'); return }
   await Promise.all([
-    supabase.from('settings').upsert({ key:'office_start_time',  value: JSON.stringify(start), updated_at: nowStr() }),
-    supabase.from('settings').upsert({ key:'office_end_time',    value: JSON.stringify(end||'18:00'), updated_at: nowStr() }),
-    supabase.from('settings').upsert({ key:'absent_after_hours', value: JSON.stringify(String(aah||'2')), updated_at: nowStr() }),
+    supabase.from('settings').upsert({ key:'office_start_time', value: JSON.stringify(start), updated_at: nowStr() }),
+    supabase.from('settings').upsert({ key:'office_end_time',   value: JSON.stringify(end||'18:00'), updated_at: nowStr() }),
+    supabase.from('settings').upsert({ key:'late_time',         value: JSON.stringify(late||start), updated_at: nowStr() }),
   ])
-  officeStart      = start
-  officeEnd        = end || '18:00'
-  absentAfterHours = Number(aah) || 2
+  officeStart = start; officeEnd = end||'18:00'; lateTime = late||start
   toast('Office settings saved ✓','success')
 }
 
-// Auto-absent: mark members absent if past (officeStart + absentAfterHours) and no check-in today
-window.runAutoAbsent = async function() {
-  const today     = todayStr()
-  const now       = new Date()
-  const [oh, om]  = officeStart.split(':').map(Number)
-  const cutoff    = new Date()
-  cutoff.setHours(oh + absentAfterHours, om, 0, 0)
-  if (now < cutoff) { toast('Cutoff time not reached yet — no action taken'); return }
-
-  const { data: members } = await supabase.from('members').select('*').eq('active',true).not('role','in','("superadmin","admin")')
+window.runMarkAllAbsent = async function() {
+  if (!confirm('Mark ALL members who have not checked in today as Absent?\n\nThis cannot be undone.')) return
+  const today = todayStr()
+  const { data: members }  = await supabase.from('members').select('id,name').eq('active',true).not('role','in','("superadmin","admin")')
   const { data: existing } = await supabase.from('attendance').select('member_id').eq('date', today)
   const checkedInIds = new Set((existing||[]).map(a=>a.member_id))
   const toMark = (members||[]).filter(m => !checkedInIds.has(m.id))
-  if (!toMark.length) { toast('No absent members to mark'); return }
-  const rows = toMark.map(m => ({ member_id:m.id, member_name:m.name, date:today, status:'absent', marked_by:'auto' }))
+  if (!toMark.length) { toast('All members already marked today ✓','success'); return }
+  const rows = toMark.map(m => ({ member_id:m.id, member_name:m.name, date:today, status:'absent', marked_by:'admin' }))
   await supabase.from('attendance').upsert(rows, { onConflict:'member_id,date' })
-  toast(`Marked ${toMark.length} member(s) absent ✓`,'success')
+  toast(`${toMark.length} member(s) marked absent ✓`,'success')
   if (adminView==='dashboard') loadDashboard()
 }
 
@@ -1155,6 +1137,98 @@ function dlCSV(fname, headers, rows) {
   const url   = URL.createObjectURL(blob)
   const a     = document.createElement('a'); a.href=url; a.download=fname
   document.body.appendChild(a); a.click(); document.body.removeChild(a); URL.revokeObjectURL(url)
+}
+
+
+// ── Glory animation — golden sparks + rising stars ────────────
+function playGloryAnimation() {
+  const canvas = document.getElementById('attCanvas'); if (!canvas) return
+  const ctx = canvas.getContext('2d')
+  canvas.width = window.innerWidth; canvas.height = window.innerHeight
+  const CX = canvas.width / 2, CY = canvas.height / 2
+  const colors = ['#ffd700','#ffec60','#00d4aa','#ffffff','#f5a623','#aaffdd']
+  const particles = Array.from({ length: 90 }, () => {
+    const angle = Math.random() * Math.PI * 2
+    const speed = 2 + Math.random() * 6
+    return { x:CX, y:CY, vx:Math.cos(angle)*speed, vy:Math.sin(angle)*speed-(1+Math.random()*3),
+             size:2+Math.random()*5, color:colors[Math.floor(Math.random()*colors.length)],
+             life:1, decay:0.012+Math.random()*0.018, rot:0, spin:(Math.random()-0.5)*0.3,
+             shape:Math.random()<0.4?'star':'circle' }
+  })
+  let textY = CY - 80, textAlpha = 1, frame = 0
+  function tick() {
+    if (!document.getElementById('attCanvas')) return
+    ctx.clearRect(0, 0, canvas.width, canvas.height)
+    let alive = 0
+    for (const p of particles) {
+      if (p.life <= 0) continue; alive++
+      p.x += p.vx; p.y += p.vy; p.vy += 0.12; p.life -= p.decay; p.rot += p.spin
+      ctx.globalAlpha = Math.max(0, p.life)
+      if (p.shape === 'star') {
+        ctx.save(); ctx.translate(p.x, p.y); ctx.rotate(p.rot)
+        ctx.beginPath()
+        for (let i = 0; i < 10; i++) {
+          const a = (i / 10) * Math.PI * 2 - Math.PI / 2
+          const r = i % 2 === 0 ? p.size : p.size * 0.45
+          i === 0 ? ctx.moveTo(Math.cos(a)*r, Math.sin(a)*r) : ctx.lineTo(Math.cos(a)*r, Math.sin(a)*r)
+        }
+        ctx.closePath(); ctx.fillStyle = p.color; ctx.fill(); ctx.restore()
+      } else {
+        ctx.beginPath(); ctx.arc(p.x, p.y, p.size * p.life, 0, Math.PI*2)
+        ctx.fillStyle = p.color; ctx.fill()
+      }
+    }
+    if (frame < 120) {
+      textY -= 0.45; textAlpha = Math.max(0, 1 - frame / 85)
+      ctx.globalAlpha = textAlpha
+      ctx.font = 'bold 28px Inter, sans-serif'; ctx.textAlign = 'center'
+      ctx.shadowColor = 'rgba(255,215,0,0.9)'; ctx.shadowBlur = 22
+      ctx.fillStyle = '#ffd700'; ctx.fillText('\uD83C\uDF1F ON TIME!', CX, textY)
+      ctx.shadowBlur = 0
+    }
+    ctx.globalAlpha = 1; frame++
+    if (alive > 0 || frame < 130) requestAnimationFrame(tick)
+    else { ctx.clearRect(0, 0, canvas.width, canvas.height); canvas.remove() }
+  }
+  requestAnimationFrame(tick)
+}
+
+// ── Late animation — amber rain + drooping text ───────────────
+function playLateAnimation() {
+  const canvas = document.getElementById('attCanvas'); if (!canvas) return
+  const ctx = canvas.getContext('2d')
+  canvas.width = window.innerWidth; canvas.height = window.innerHeight
+  const W = canvas.width, H = canvas.height, CX = W / 2, CY = H / 2
+  const drops = Array.from({ length: 55 }, () => ({
+    x: Math.random() * W, y: -20 - Math.random() * H * 0.5,
+    len: 8 + Math.random() * 18, speed: 1.8 + Math.random() * 2.2,
+    alpha: 0.12 + Math.random() * 0.3,
+    color: Math.random() < 0.5 ? '#f5a623' : '#e67e22'
+  }))
+  let textY = CY - 50, textAlpha = 0, frame = 0
+  function tick() {
+    if (!document.getElementById('attCanvas')) return
+    ctx.clearRect(0, 0, W, H)
+    ctx.fillStyle = 'rgba(22,8,0,0.14)'; ctx.fillRect(0, 0, W, H)
+    for (const d of drops) {
+      d.y += d.speed
+      if (d.y - d.len > H) { d.y = -d.len; d.x = Math.random() * W }
+      ctx.beginPath(); ctx.moveTo(d.x, d.y); ctx.lineTo(d.x - d.speed*0.3, d.y - d.len)
+      ctx.strokeStyle = d.color; ctx.globalAlpha = d.alpha; ctx.lineWidth = 1.2; ctx.stroke()
+    }
+    textAlpha = Math.min(1, frame / 30) * Math.max(0, 1 - (frame - 90) / 60)
+    const droop = frame < 30 ? (1 - frame / 30) * 15 : 0
+    ctx.globalAlpha = textAlpha
+    ctx.font = 'bold 26px Inter, sans-serif'; ctx.textAlign = 'center'
+    ctx.shadowColor = 'rgba(245,166,35,0.7)'; ctx.shadowBlur = 18
+    ctx.fillStyle = '#f5a623'
+    ctx.fillText("\uD83D\uDD50 You're late\u2026", CX, textY + droop)
+    ctx.shadowBlur = 0
+    ctx.globalAlpha = 1; frame++
+    if (frame < 190) requestAnimationFrame(tick)
+    else { ctx.clearRect(0, 0, W, H); canvas.remove() }
+  }
+  requestAnimationFrame(tick)
 }
 
 // ─── Start ────────────────────────────────────────────────────
