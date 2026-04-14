@@ -1,50 +1,49 @@
-// Generates a stable device fingerprint from browser characteristics.
-// Not 100% unbreakable but sufficient to prevent casual check-in spoofing.
+// ─── Device Identity ──────────────────────────────────────────
+//
+// Strategy: use localStorage as the primary device ID.
+// On first login from a device, we generate a random UUID and store
+// it in localStorage. That UUID becomes the device fingerprint.
+// It never changes unless the user deliberately clears their browser data.
+//
+// Why not use browser signals (userAgent, screen, canvas)?
+//   - userAgent changes on every browser update (Chrome auto-updates silently)
+//   - screen dimensions change when monitors are connected/disconnected
+//   - timezoneOffset changes on DST switches twice a year
+//   - canvas output changes after GPU/OS/browser updates
+//   All of these cause false "wrong device" errors within days or weeks.
+//
+// The localStorage UUID approach:
+//   - Stable forever on the same browser+device
+//   - Changes only if the user clears browser storage (very rare, intentional)
+//   - Still prevents casual buddy-punching (someone else's phone won't have the UUID)
+//   - Admin can reset it from the Members tab if genuinely needed
+
+const DEVICE_ID_KEY = 'haazri_device_id'
+
 export async function getDeviceFingerprint() {
-  const nav = window.navigator
-  const screen = window.screen
-  const parts = [
-    nav.userAgent,
-    nav.language,
-    nav.platform,
-    screen.colorDepth,
-    screen.width + 'x' + screen.height,
-    new Date().getTimezoneOffset(),
-    nav.hardwareConcurrency || '',
-    nav.deviceMemory || '',
-    // Canvas fingerprint
-    await canvasFingerprint(),
-  ]
-  const raw = parts.join('|')
-  return await hashString(raw)
+  // Return existing stored ID if present
+  let id = localStorage.getItem(DEVICE_ID_KEY)
+  if (id && id.length >= 32) return id
+
+  // Generate a new stable random ID for this device
+  id = generateDeviceId()
+  localStorage.setItem(DEVICE_ID_KEY, id)
+  return id
 }
 
-async function canvasFingerprint() {
-  try {
-    const canvas = document.createElement('canvas')
-    canvas.width = 200; canvas.height = 50
-    const ctx = canvas.getContext('2d')
-    ctx.textBaseline = 'top'
-    ctx.font = '14px Arial'
-    ctx.fillStyle = '#f60'
-    ctx.fillRect(125, 1, 62, 20)
-    ctx.fillStyle = '#069'
-    ctx.fillText('FreelanceHQ 🕐', 2, 15)
-    ctx.fillStyle = 'rgba(102,204,0,0.7)'
-    ctx.fillText('FreelanceHQ 🕐', 4, 17)
-    return canvas.toDataURL().slice(-50)
-  } catch { return 'no-canvas' }
+function generateDeviceId() {
+  // 48 hex chars — enough entropy to be unique
+  const arr = new Uint8Array(24)
+  crypto.getRandomValues(arr)
+  return Array.from(arr).map(b => b.toString(16).padStart(2, '0')).join('')
 }
 
 async function hashString(str) {
-  const encoder = new TextEncoder()
-  const data = encoder.encode(str)
-  const hashBuffer = await crypto.subtle.digest('SHA-256', data)
-  const hashArray = Array.from(new Uint8Array(hashBuffer))
-  return hashArray.map(b => b.toString(16).padStart(2, '0')).join('').slice(0, 32)
+  const data = new TextEncoder().encode(str)
+  const buf  = await crypto.subtle.digest('SHA-256', data)
+  return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2,'0')).join('').slice(0, 32)
 }
 
-// Simple password hashing using SHA-256 (not bcrypt — we handle auth server-side via Supabase)
 export async function hashPassword(password) {
   return await hashString(password + 'freelancehq_salt_2024')
 }

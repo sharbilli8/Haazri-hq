@@ -76,3 +76,10 @@ values (
   true,
   true
 );
+
+-- Additional settings for office end time and auto-absent threshold
+insert into settings (key, value) values ('office_end_time',    '"18:00"') on conflict (key) do nothing;
+insert into settings (key, value) values ('absent_after_hours', '"2"')     on conflict (key) do nothing;
+
+-- Late threshold time (separate from office start)
+insert into settings (key, value) values ('late_time', '"09:00"') on conflict (key) do nothing;
